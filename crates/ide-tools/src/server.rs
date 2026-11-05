@@ -7,7 +7,7 @@ use ide_core::CancellationToken;
 use ide_core::{IdeError, IdeResult};
 use std::path::{Path, PathBuf};
 
-const RELEASES: &str = "https://github.com/l0ng-ai/openidea/releases/download";
+const RELEASES: &str = "https://github.com/finalpi/openidea/releases/download";
 
 /// Host platforms with a published server (Rust's `OS`-`ARCH` names).
 pub const PLATFORMS: &[(&str, &str)] =

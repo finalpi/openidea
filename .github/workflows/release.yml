@@ -64,9 +64,12 @@ jobs:
               core.setOutput("id", existing.id);
               return;
             }
+            const fs = require("fs");
+            const notes = `docs/releases/${tag}.md`;
+            const body = fs.existsSync(notes) ? fs.readFileSync(notes, "utf8") : undefined;
             const { data } = await github.rest.repos.createRelease({
-              owner, repo, tag_name: tag, name: `OpenIDEA ${tag}`,
-              draft: true, prerelease: tag.includes("-"), generate_release_notes: true,
+              owner, repo, tag_name: tag, name: `OpenIDEA ${tag} (finalpi)`,
+              draft: true, prerelease: tag.includes("-"), body, generate_release_notes: !body,
             });
             core.setOutput("id", data.id);
 
@@ -134,6 +137,16 @@ jobs:
             [ -n "${!v}" ] && { echo "$v<<__EOF__"; echo "${!v}"; echo "__EOF__"; } >> "$GITHUB_ENV"
           done
           true
+      - name: Configure updater artifacts
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const file = "src-tauri/tauri.conf.json";
+            const config = JSON.parse(fs.readFileSync(file, "utf8"));
+            config.bundle.createUpdaterArtifacts = Boolean(process.env.TAURI_SIGNING_PRIVATE_KEY);
+            fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n");
+          '
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -198,6 +211,30 @@ jobs:
           if command -v sha256sum >/dev/null; then sha256sum "$ASSET"; else shasum -a 256 "$ASSET"; fi > "$ASSET.sha256"
           gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
 
+      - name: Build and publish Commit Assistant
+        if: matrix.os == 'linux' && matrix.arch == 'x86_64'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          export CC_${TARGET//-/_}=musl-gcc
+          rustup target add wasm32-wasip2
+          CARGO_TARGET_DIR="$PWD/target/plugins" plugins/build.sh --check official/commit-assistant
+          cargo build --release --locked -p ide-host --bin openidea-plugin --target "$TARGET"
+          tool="$PWD/target/$TARGET/release/openidea-plugin"
+          plugin="plugins/official/commit-assistant"
+          id="$(sed -n 's/^id *= *"\(.*\)".*/\1/p' "$plugin/plugin.toml" | head -1)"
+          version="$(sed -n 's/^version *= *"\(.*\)".*/\1/p' "$plugin/plugin.toml" | head -1)"
+          out="$RUNNER_TEMP/commit-assistant"
+          mkdir -p "$out"
+          cp LICENSE NOTICE "$plugin/"
+          "$tool" pack "$plugin" --out "$out/$id-$version.oiplugin"
+          "$tool" check "$out/$id-$version.oiplugin"
+          gzip -9 -c "$tool" > "$out/openidea-plugin-linux-x86_64.gz"
+          (cd "$out" && sha256sum *.oiplugin *.gz > SHA256SUMS-plugins.txt)
+          gh release upload "$TAG" "$out"/* --clobber
+
   # The official plugins, signed, and the marketplace index released apps read
   # (releases/latest/download/plugins-index.json). They are not in the
   # installers: users install them from Settings › Plugins. Without the
@@ -257,6 +294,7 @@ jobs:
           for dir in plugins/official/*/; do
             id="$(sed -n 's/^id *= *"\(.*\)".*/\1/p' "$dir/plugin.toml" | head -1)"
             version="$(sed -n 's/^version *= *"\(.*\)".*/\1/p' "$dir/plugin.toml" | head -1)"
+            [[ "$id" == openidea.* ]] || continue
             "$tool" pack "$dir" --key "$key" --publisher openidea --out "$out/$id-$version.oiplugin"
           done
           # The published index's revocations, earlier keys and community plugins carry over.
