@@ -632,3 +632,43 @@ fn workspace_scope_excludes_state_from_scans_updates_and_cached_results() {
     assert!(idx.wait_idle(WAIT));
     assert!(idx.find_files("", 100).is_empty());
 }
+
+#[test]
+fn file_only_mode_avoids_parsing_and_restores_the_full_cache() {
+    let f = sample();
+    let full = f.open();
+    let expected_files = files(&full, "");
+    assert!(!symbols(&full, "Config", SymbolFilter::All).is_empty());
+    drop(full);
+    let idx = ProjectIndex::open_with_symbols(
+        &f.root,
+        &f.cache,
+        Vec::new(),
+        vec!["**/node_modules".into(), "**/target".into()],
+        Arc::new(LanguageRegistry::load(None).unwrap()),
+        Arc::new(Syntax::new()),
+        Arc::new(NullSink),
+        false,
+    )
+    .unwrap();
+    assert!(idx.wait_idle(WAIT));
+    assert_eq!(idx.shared.parsed.load(Ordering::SeqCst), 0);
+    assert_eq!(files(&idx, ""), expected_files);
+    assert!(symbols(&idx, "Config", SymbolFilter::All).is_empty());
+    let changed = f.write("src/main.rs", "struct Changed {}\n");
+    idx.update(&[changed], &[]);
+    assert!(idx.wait_idle(WAIT));
+    assert_eq!(idx.shared.parsed.load(Ordering::SeqCst), 0);
+    idx.set_symbols_enabled(true);
+    assert!(idx.wait_idle(WAIT));
+    assert_eq!(idx.shared.parsed.load(Ordering::SeqCst), 1, "reuse unchanged cached symbols");
+    assert!(!symbols(&idx, "Changed", SymbolFilter::All).is_empty());
+    idx.set_symbols_enabled(false);
+    assert!(idx.wait_idle(WAIT));
+    assert!(symbols(&idx, "Changed", SymbolFilter::All).is_empty());
+    assert_eq!(files(&idx, ""), expected_files);
+    drop(idx);
+    let normal = f.open();
+    assert!(!symbols(&normal, "Changed", SymbolFilter::All).is_empty());
+    assert_eq!(normal.shared.parsed.load(Ordering::SeqCst), 0, "file-only mode must not overwrite the full cache");
+}

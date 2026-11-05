@@ -119,7 +119,7 @@ impl Host {
             })?;
         }
         let project_key = project_key(&root);
-        let index = ProjectIndex::open(
+        let index = ProjectIndex::open_with_symbols(
             &root,
             &self.local_data_dir.join("index").join(&project_key),
             index_roots(&root, extra_roots.clone()),
@@ -127,6 +127,7 @@ impl Host {
             languages.clone(),
             self.syntax(),
             sink.clone(),
+            !settings.effective().general.power_save_mode,
         )?;
         mark("index");
         let lsp = LspManager::new(root.clone(), languages.clone(), sink.clone());
@@ -262,7 +263,12 @@ impl Host {
         {
             let settings = settings.clone();
             lsp.set_servers_hook(Box::new(move |language, defined| {
-                ide_sdk::apply::language_servers(language.as_str(), defined, &settings.effective())
+                let effective = settings.effective();
+                if effective.general.power_save_mode {
+                    Vec::new()
+                } else {
+                    ide_sdk::apply::language_servers(language.as_str(), defined, &effective)
+                }
             }));
         }
         {

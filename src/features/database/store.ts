@@ -412,7 +412,8 @@ export async function disconnect(id: string): Promise<void> {
 
 /** Disconnects targets idle past their data source's Auto-disconnect; returns the stopper. */
 export function watchIdleConnections(everyMs = 5000): () => void {
-  const timer = setInterval(() => {
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const tick = () => {
     const s = useDatabase.getState();
     const running = new Set(Object.keys(s.running).map((path) => s.consoles[path]));
     const busy = (t: string) => running.has(t) || s.pendingTx.has(t);
@@ -420,8 +421,27 @@ export function watchIdleConnections(everyMs = 5000): () => void {
       lastUsed.delete(t);
       void disconnect(t).then(() => log("info", `${targetLabel(t)}: disconnected after being idle`));
     }
-  }, everyMs);
-  return () => clearInterval(timer);
+  };
+  const sync = () => {
+    const s = useDatabase.getState();
+    const needed = s.sources.some(
+      (source) =>
+        source.id !== undefined &&
+        (source.options?.autoDisconnectSecs ?? 0) > 0 &&
+        connectedTargets(source.id).length > 0,
+    );
+    if (needed && timer === undefined) timer = setInterval(tick, everyMs);
+    else if (!needed && timer !== undefined) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+  };
+  sync();
+  const unsubscribe = useDatabase.subscribe(sync);
+  return () => {
+    unsubscribe();
+    clearInterval(timer);
+  };
 }
 
 /** Console files of coloured data sources, tinted like IDEA's (file decorations). */

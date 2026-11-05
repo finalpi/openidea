@@ -82,6 +82,7 @@ impl Capability {
             Self::Clipboard => {
                 "Copy to the clipboard from its commands, and read and write it from its web views".into()
             }
+            Self::Net(host) if host == "*" => "Connect to any host (for a user-configured endpoint)".into(),
             Self::Net(host) => format!("Connect to {host} (from the machine the project is on)"),
             Self::Process(bin) => format!("Run {bin} — equivalent to running arbitrary code on this machine"),
             Self::FsRead(path) => format!("Read files under {path}, outside the project"),
@@ -106,7 +107,7 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     match pattern.strip_prefix("*.") {
         Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
-        None => host == pattern,
+        None => pattern == "*" || host == pattern,
     }
 }
 
@@ -150,7 +151,11 @@ impl FromStr for Capability {
                                 && label.len() <= 63
                                 && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
                         });
-                    if valid { Ok(Self::Net(arg.to_ascii_lowercase())) } else { Err(format!("invalid host in {s:?}")) }
+                    if valid || arg == "*" {
+                        Ok(Self::Net(arg.to_ascii_lowercase()))
+                    } else {
+                        Err(format!("invalid host in {s:?}"))
+                    }
                 }
                 "process" => {
                     if arg.contains(['/', '\\']) && !std::path::Path::new(arg).is_absolute() {
@@ -275,5 +280,20 @@ mod tests {
         assert!(any_gh.covers(&"net:api.github.com".parse().unwrap()));
         assert!(Capability::FsRead("/etc".into()).covers(&Capability::FsRead("/etc/hosts".into())));
         assert!(!Capability::FsRead("/etc".into()).covers(&Capability::FsRead("/etcx".into())));
+    }
+}
+
+#[cfg(test)]
+mod configurable_endpoint_tests {
+    use super::*;
+    #[test]
+    fn any_host_is_an_explicit_grant_not_a_change_to_host_specific_grants() {
+        let any: Capability = "net:*".parse().unwrap();
+        assert!(any.covers(&"net:api.example.com".parse().unwrap()));
+        assert!(any.covers(&"net:localhost".parse().unwrap()));
+        assert!(!"net:api.openai.com".parse::<Capability>().unwrap().covers(&any));
+        assert!(!"net:api.openai.com".parse::<Capability>().unwrap().covers(&"net:example.com".parse().unwrap()));
+        assert!(!any.auto_migrates());
+        assert!(!any.covers(&Capability::Secrets));
     }
 }

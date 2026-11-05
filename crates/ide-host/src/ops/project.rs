@@ -185,9 +185,17 @@ pub fn set_settings(
         .iter()
         .any(|k| key == *k || key.starts_with(&format!("{k}.")));
     // Code style only reaches servers as settings (e.g. jdtls' formatter profile); builds don't depend on it.
-    if code_style || toolchain {
+    let power_save = key == "general" || key == "general.powerSaveMode";
+    if power_save {
         for project in affected() {
-            if toolchain && let Some(bridge) = &project.kotlin_bridge {
+            project.index.set_symbols_enabled(!project.settings.effective().general.power_save_mode);
+        }
+    }
+    if code_style || toolchain || power_save {
+        for project in affected() {
+            if (toolchain || power_save)
+                && let Some(bridge) = &project.kotlin_bridge
+            {
                 bridge.schedule();
             }
             let lsp = project.lsp.clone();

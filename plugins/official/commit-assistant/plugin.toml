@@ -1,0 +1,43 @@
+id = "finalpi.commit-assistant"
+name = "Commit Assistant"
+version = "0.1.0"
+description = "Generate a commit message from staged changes, offline or with your OpenAI-compatible API. Runs only when requested."
+authors = ["finalpi"]
+license = "Apache-2.0"
+categories = ["vcs", "ai"]
+engines.openidea = "^1.0"
+wasm = "dist/plugin.wasm"
+activation = ["on-command:*"]
+
+[capabilities]
+required = ["project.read", "process:git"]
+optional = ["net:*", "secrets", "clipboard"]
+
+[[contributes.commands]]
+id = "generate-ai"
+title = "Generate Commit Message with AI (Staged Changes)"
+category = "Git"
+when = "vcsAvailable"
+
+[[contributes.commands]]
+id = "generate-offline"
+title = "Generate Commit Message Offline (Staged Changes)"
+category = "Git"
+when = "vcsAvailable"
+
+[[contributes.commitMessages]]
+command = "generate-ai"
+title = "Generate with AI (staged changes)"
+
+[[contributes.commitMessages]]
+command = "generate-offline"
+title = "Generate offline (staged changes)"
+
+[[contributes.secrets]]
+name = "api-key"
+label = "API Key"
+description = "Sent only to the endpoint you configure, when you choose AI generation. Stored by the IDE, not in settings."
+
+[contributes.settings]
+title = "Commit Assistant"
+schema = "settings.schema.json"

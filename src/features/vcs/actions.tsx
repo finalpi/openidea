@@ -1,3 +1,4 @@
+import { generateCommitMessage } from "./generateMessage";
 import { showShelfDiff } from "./shelf";
 import { commitRepo } from "./multiRoot";
 /** VCS actions (ids match keymaps/intellij-macos.ts where bound). */
@@ -158,6 +159,13 @@ function showOperations() {
 
 export function registerVcsActions(): () => void {
   const actions: Action[] = [
+    {
+      id: "vcs.generateCommitMessage",
+      title: "Generate Commit Message from Staged Changes",
+      category: "Git",
+      when: VCS,
+      run: ({ arg }) => generateCommitMessage(typeof arg === "string" ? arg : undefined),
+    },
     {
       id: "vcs.operations",
       title: "VCS Operations…",

@@ -602,9 +602,12 @@ impl Visibility<'_> {
         if let Some(shown) = self.matches.get(&id) {
             return Ok(*shown);
         }
-        let indexed = self.index.indexed(&id.to_string());
-        let shown = if (indexed && self.user_candidates.as_ref().is_some_and(|ids| !ids.contains(&id.to_string())))
-            || (indexed && self.path_candidates.as_ref().is_some_and(|ids| !ids.contains(&id.to_string())))
+        let key = id.to_string();
+        let indexed = self.index.indexed(&key);
+        let filtered = indexed
+            && (self.user_candidates.as_ref().is_some_and(|ids| !ids.contains(&key))
+                || self.path_candidates.as_ref().is_some_and(|ids| !ids.contains(&key)));
+        let shown = if filtered
             || !repo.has_object(id)
             || self.path_ids.as_ref().is_some_and(|ids| !ids.contains(&id))
             || self.range_ids.as_ref().is_some_and(|ids| !ids.contains(&id))

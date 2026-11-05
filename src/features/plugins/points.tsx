@@ -3,6 +3,7 @@
  * declaration is projected onto the workbench, and how its items appear on
  * the plugin details page. One `defineUiPoint` per contribution type.
  */
+import { registerCommitMessageGenerator } from "@/workbench/contributions";
 import type { PluginInfo, ThemeDef } from "@/bindings";
 import { registerAction } from "@/platform/actions";
 import { tx } from "@/platform/i18n";
@@ -136,6 +137,15 @@ function IconThemesDetails({ plugin, items }: { plugin: PluginInfo; items: UiIte
 /** Registers the client side of every first-party UI point. */
 export function defineBuiltinUiPoints(): () => void {
   const disposers = [
+    defineUiPoint<{ command: string; title: string }>("commitMessages", {
+      title: "Commit Message Generators",
+      project: ({ pluginId, decl }) =>
+        registerCommitMessageGenerator({
+          id: pluginActionId(pluginId, decl.command),
+          title: decl.title,
+          generate: (repo) => runPluginCommand(pluginId, decl.command, JSON.stringify({ repo })),
+        }),
+    }),
     defineUiPoint<CommandDecl>("commands", {
       title: "Commands",
       project: ({ pluginId, decl }, { plugin }) =>

@@ -1537,3 +1537,25 @@ export function registerCloneSource(source: CloneSourceContribution): () => void
 export function cloneSourceList(sources = useCloneSources.getState().sources): CloneSourceContribution[] {
   return [...sources.values()].sort((a, b) => (a.order ?? 100) - (b.order ?? 100) || a.id.localeCompare(b.id));
 }
+
+// On-demand commit message generators supplied by plugins. Results are drafts only.
+export interface CommitMessageGenerator {
+  id: string;
+  title: string;
+  generate(repo: string | null): Promise<string | null | undefined>;
+}
+
+export const useCommitMessageGenerators = create<{ generators: ReadonlyMap<string, CommitMessageGenerator> }>(() => ({
+  generators: new Map(),
+}));
+
+export function registerCommitMessageGenerator(generator: CommitMessageGenerator): () => void {
+  useCommitMessageGenerators.setState((s) => ({ generators: new Map(s.generators).set(generator.id, generator) }));
+  return () =>
+    useCommitMessageGenerators.setState((s) => {
+      if (s.generators.get(generator.id) !== generator) return s;
+      const generators = new Map(s.generators);
+      generators.delete(generator.id);
+      return { generators };
+    });
+}

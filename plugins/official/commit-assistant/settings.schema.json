@@ -1,0 +1,22 @@
+{
+  "properties": {
+    "endpoint": {
+      "type": "string",
+      "default": "https://api.openai.com/v1",
+      "title": "API base URL",
+      "description": "OpenAI-compatible base URL (with or without /v1). HTTPS required except localhost."
+    },
+    "model": {
+      "type": "string",
+      "default": "",
+      "title": "Model",
+      "description": "The model ID provided by your API service."
+    },
+    "language": {
+      "type": "string",
+      "default": "zh",
+      "enum": ["zh", "en"],
+      "title": "Commit message language"
+    }
+  }
+}

@@ -168,6 +168,9 @@ impl KotlinBridge {
             let root = self.root.clone();
             let cache = self.cache.clone();
             let settings = self.settings.effective();
+            if settings.general.power_save_mode {
+                continue;
+            }
             let has_sources = tokio::task::spawn_blocking(move || {
                 let model = crate::ops::build::load(&root, &cache, &settings);
                 let enabled =

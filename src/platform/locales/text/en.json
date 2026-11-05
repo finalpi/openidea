@@ -4,5 +4,14 @@
   "WSL distribution:": "WSL distribution:",
   "WSL distribution": "WSL distribution",
   "Project runs on {label}": "Project runs on {label}",
-  "Forwarding ports is not supported in a WSL project yet": "Forwarding ports is not supported in a WSL project yet"
+  "Forwarding ports is not supported in a WSL project yet": "Forwarding ports is not supported in a WSL project yet",
+  "Commit Message Generators": "Commit Message Generators",
+  "Generate Commit Message from Staged Changes": "Generate Commit Message from Staged Changes",
+  "Generating commit message…": "Generating commit message…",
+  "Generate from staged changes": "Generate from staged changes",
+  "Commit message generators": "Commit message generators",
+  "Install a commit message generator plugin first": "Install a commit message generator plugin first",
+  "The draft or repository changed; generate the message again": "The draft or repository changed; generate the message again",
+  "Could not generate commit message": "Could not generate commit message",
+  "Power save mode is on: language servers, symbol indexing and automatic suggestions are paused. Git and file search remain available.": "Power save mode is on: language servers, symbol indexing and automatic suggestions are paused. Git and file search remain available."
 }

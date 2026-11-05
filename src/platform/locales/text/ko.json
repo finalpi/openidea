@@ -2815,7 +2815,6 @@
   "Cannot rename project": "프로젝트 이름을 변경할 수 없습니다",
   "Power Save Mode": "절전 모드",
   "Cannot change Power Save Mode": "절전 모드를 변경할 수 없습니다",
-  "Power save mode is on: completion and documentation popups and usage highlighting are off.": "절전 모드가 켜져 있습니다: 완성 및 문서 팝업과 사용 위치 강조 표시가 꺼집니다.",
   "This needs the desktop app": "데스크톱 앱이 필요합니다",
   "Turn Off": "끄기",
   "Build Tools": "빌드 도구",

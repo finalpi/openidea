@@ -33,7 +33,8 @@ import {
   type TreeHandle,
   T,
 } from "@/ui";
-import { editorService } from "@/workbench/contributions";
+import { editorService, useCommitMessageGenerators } from "@/workbench/contributions";
+import { useMessageGeneration } from "./generateMessage";
 import { useToolWindowLayout } from "@/workbench/toolwindows/store";
 import {
   aggregateCheck,
@@ -771,6 +772,10 @@ export function CommitMessageField({ included, runner }: { included: number; run
   const focusTick = useCommit((s) => s.focusTick);
   const ref = useRef<HTMLTextAreaElement>(null);
   const historyRef = useRef<HTMLButtonElement>(null);
+  const generateRef = useRef<HTMLButtonElement>(null);
+  const generators = useCommitMessageGenerators((s) => s.generators);
+  const generating = useMessageGeneration((s) => s.busy);
+  const [generatorsOpen, setGeneratorsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const historyTick = useCommit((s) => s.historyTick);
   const checkProblems = useCommit((s) => s.checkProblems);
@@ -828,6 +833,32 @@ export function CommitMessageField({ included, runner }: { included: number; run
             },
           }))}
         />
+        {generators.size > 0 && (
+          <>
+            <IconButton
+              ref={generateRef}
+              icon={generating ? "spinner" : "lightbulb"}
+              title={generating ? "Generating commit message…" : "Generate from staged changes"}
+              size="small"
+              disabled={generating}
+              aria-haspopup="menu"
+              aria-expanded={generatorsOpen}
+              onClick={() => setGeneratorsOpen((open) => !open)}
+            />
+            <Menu
+              open={generatorsOpen}
+              onClose={() => setGeneratorsOpen(false)}
+              anchor={generateRef}
+              placement="bottom-end"
+              aria-label="Commit message generators"
+              items={[...generators.values()].map((generator) => ({
+                id: generator.id,
+                label: generator.title,
+                run: () => void executeAction("vcs.generateCommitMessage", generator.id),
+              }))}
+            />
+          </>
+        )}
         <span className={styles.grow} />
         {tooLong && (
           <span className={clsx(styles.lineLen, styles.lineLenWarn)} title={tx("Subject line length")}>

@@ -287,7 +287,7 @@ impl ClickhousePool {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let body = response.bytes().await.map_err(http_error)?;
-        if status.is_success() && !code.as_deref().is_some_and(|code| code != "0") && !body.starts_with(b"Code:") {
+        if status.is_success() && code.as_deref().is_none_or(|code| code == "0") && !body.starts_with(b"Code:") {
             Ok(())
         } else {
             Err(self.server_error(status, code.as_deref(), &body))

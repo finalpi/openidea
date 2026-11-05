@@ -2807,7 +2807,6 @@
   "Cannot rename project": "Nie można zmienić nazwy projektu",
   "Power Save Mode": "Tryb oszczędzania energii",
   "Cannot change Power Save Mode": "Nie można zmienić trybu oszczędzania energii",
-  "Power save mode is on: completion and documentation popups and usage highlighting are off.": "Tryb oszczędzania energii jest włączony: podpowiedzi, okna wyskakujące z dokumentacją oraz podświetlanie użycia są wyłączone.",
   "This needs the desktop app": "To wymaga aplikacji stacjonarnej",
   "Turn Off": "Wyłącz",
   "Build Tools": "Narzędzia budowania",

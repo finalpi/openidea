@@ -229,6 +229,30 @@ fn fixture(limits: Limits) -> Fixture {
     Fixture { host, workspace, events, _tmp: tmp, plugins_dir, project }
 }
 
+#[test]
+fn commit_assistant_reads_a_real_staging_area_without_changing_it() {
+    let f = fixture(Limits::default());
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(&f.project).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    };
+    git(&["init", "--quiet"]);
+    git(&["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"]);
+    std::fs::write(f.project.join(".env"), "TEST_SECRET=not-a-real-secret").unwrap();
+    git(&["add", "src/notes.txt", ".env"]);
+    let before = git(&["diff", "--cached", "--raw"]);
+    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/official/commit-assistant");
+    let info = f.install(&package);
+    assert_eq!(info.id, "finalpi.commit-assistant");
+    assert_eq!(f.host.ui_items("commitMessages").len(), 2);
+    let message = f.run("finalpi.commit-assistant", "generate-offline", Some("{}")).unwrap().unwrap();
+    assert!(message.contains("src/notes.txt"));
+    assert!(!message.contains(".env"));
+    assert_eq!(git(&["diff", "--cached", "--raw"]), before);
+    assert_eq!(git(&["rev-list", "--count", "HEAD"]), b"1\n");
+}
+
 impl Fixture {
     fn inv(&self) -> Invocation {
         Invocation { client: Some("main".into()), workspace_root: Some(self.project.clone()), editor: None }

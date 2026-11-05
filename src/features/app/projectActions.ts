@@ -202,7 +202,7 @@ export function registerPowerSaveBanner(): () => void {
       const on = useProject((s) => isPowerSaveMode(s.settings));
       return on
         ? {
-            text: "Power save mode is on: completion and documentation popups and usage highlighting are off.",
+            text: "Power save mode is on: language servers, symbol indexing and automatic suggestions are paused. Git and file search remain available.",
             actions: [{ label: "Turn Off", run: () => void togglePowerSave() }],
           }
         : null;

@@ -54,6 +54,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+pub const COMMIT_MESSAGES: &str = "commitMessages";
 pub const MENUS: &str = "menus";
 pub const KEYMAPS: &str = "keymaps";
 pub const STATUS_BAR: &str = "statusBar";
@@ -62,6 +63,20 @@ pub const VIEWS: &str = "views";
 pub const CUSTOM_EDITORS: &str = "customEditors";
 pub const FILE_ICONS: &str = "fileIcons";
 pub const FILE_TEMPLATES: &str = "fileTemplates";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CommitMessageDecl {
+    command: String,
+    title: String,
+}
+
+pub(super) fn commit_message(pkg: &Package, decl: toml::Value) -> Result<UiDecl, String> {
+    let d: CommitMessageDecl = decode(COMMIT_MESSAGES, decl)?;
+    declared_command(pkg, COMMIT_MESSAGES, &d.command)?;
+    title(COMMIT_MESSAGES, &d.title)?;
+    Ok(UiDecl::new(d.command.clone(), d.title.clone(), json(&d)?))
+}
 
 const MENU_IDS: [&str; 4] = ["editor.context", "projectView.context", "editorTab.context", "tools"];
 const MAX_TITLE: usize = 256;

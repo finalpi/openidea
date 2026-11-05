@@ -4,6 +4,8 @@
  * widget / Branches popup show incoming commits. `auto` stops for the session
  * after the first failure (credentials needed, offline); `never` disables it.
  */
+import { isPowerSaveMode } from "@/platform/editorSettings";
+import { useProject } from "@/platform/project";
 import { Channel } from "@tauri-apps/api/core";
 import { call, commands, isTauri, nextRequestId } from "@/platform/ipc";
 import { onWorkflowSettingsChange, workflowSettings } from "@/platform/workflowSettings";
@@ -22,6 +24,7 @@ export function installIncomingCheck(): () => void {
   const schedule = (delay: number) => {
     clearTimeout(timer);
     const mode = workflowSettings().vcs.git.incomingCheck;
+    if (isPowerSaveMode() || document.hidden) return;
     if (mode === "never" || (mode === "auto" && failed) || !useVcs.getState().available) return;
     timer = setTimeout(() => void check(), delay);
   };
@@ -55,11 +58,18 @@ export function installIncomingCheck(): () => void {
       schedule(FIRST_DELAY);
     },
   );
+  const reschedule = () => schedule(FIRST_DELAY);
+  const unsubPower = useProject.subscribe((s, prev) => {
+    if (isPowerSaveMode(s.settings) !== isPowerSaveMode(prev.settings)) reschedule();
+  });
+  document.addEventListener("visibilitychange", reschedule);
   root = useVcs.getState().root;
   schedule(FIRST_DELAY);
   return () => {
     clearTimeout(timer);
     unsubVcs();
     unsubSettings();
+    unsubPower();
+    document.removeEventListener("visibilitychange", reschedule);
   };
 }

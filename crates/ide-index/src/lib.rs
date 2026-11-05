@@ -105,6 +105,21 @@ impl ProjectIndex {
         syntax: Arc<Syntax>,
         sink: SharedSink,
     ) -> IdeResult<Arc<Self>> {
+        Self::open_with_symbols(root, cache_dir, content_roots, excludes, languages, syntax, sink, true)
+    }
+
+    /// File-name-only mode skips content reads, hashing and symbol extraction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_symbols(
+        root: &Path,
+        cache_dir: &Path,
+        content_roots: impl Into<IndexRoots>,
+        excludes: Vec<String>,
+        languages: Arc<LanguageRegistry>,
+        syntax: Arc<Syntax>,
+        sink: SharedSink,
+        symbols: bool,
+    ) -> IdeResult<Arc<Self>> {
         let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_owned());
         if !root.is_dir() {
             return Err(ide_core::IdeError::not_found(format!("{} is not a directory", root.display())));
@@ -112,6 +127,7 @@ impl ProjectIndex {
         let store = store::Store::open(cache_dir, &root, &syntax.fingerprint());
         let filter = filter::PathFilter::new(&root, &content_roots.into(), &excludes);
         let shared = Arc::new(Shared::new(filter, languages, syntax, sink, store));
+        shared.symbols_enabled.store(symbols, Ordering::Relaxed);
         Self::start(shared, root, true)
     }
 
@@ -138,6 +154,11 @@ impl ProjectIndex {
                 .map_err(|e| ide_core::IdeError::internal(format!("cannot start indexer: {e}")))?
         };
         Ok(Arc::new(Self { shared, worker: Mutex::new(Some(worker)), root }))
+    }
+
+    /// Rebuilds in the worker when switching between file names and full symbols.
+    pub fn set_symbols_enabled(&self, enabled: bool) {
+        self.shared.enqueue(Job::Symbols(enabled));
     }
 
     /// Changes what is indexed besides the root (content roots) and the exclude

@@ -24,6 +24,7 @@ pub(crate) enum Job {
     Changed(Vec<PathBuf>),
     Removed(Vec<PathBuf>),
     SaveRecent,
+    Symbols(bool),
     /// The roots or excludes changed: scan again (unchanged files are kept).
     Rescan,
     /// File types changed: re-parse the indexed files whose language under the
@@ -48,6 +49,7 @@ pub(crate) struct Shared {
     pub recent: Mutex<Vec<PathBuf>>,
     pub store: Option<Store>,
     pub indexing: AtomicBool,
+    pub symbols_enabled: AtomicBool,
     pub cancelled: AtomicBool,
     /// Files whose content was (re)read and parsed; observability for tests.
     pub parsed: std::sync::atomic::AtomicUsize,
@@ -73,6 +75,7 @@ impl Shared {
             recent: Mutex::default(),
             store,
             indexing: AtomicBool::new(true),
+            symbols_enabled: AtomicBool::new(true),
             cancelled: AtomicBool::new(false),
             parsed: Default::default(),
             queue: Mutex::default(),
@@ -170,19 +173,22 @@ impl Shared {
         let Some(store) = &self.store else { return };
         let filter = self.filter();
         let root = filter.root().to_owned();
-        match store.load() {
-            Ok(records) => {
-                let entries: Vec<FileEntry> = records
-                    .into_par_iter()
-                    .filter(|(rel, _)| !filter.is_excluded(&root.join(rel), false))
-                    .map(|(rel, rec)| FileEntry::new(root.join(&rel), rel, rec))
-                    .collect();
-                let mut d = self.data.write();
-                for e in entries {
-                    d.insert(e);
+        // Keep the full-symbol cache untouched while in file-name-only mode.
+        if self.symbols_enabled.load(Ordering::Relaxed) {
+            match store.load() {
+                Ok(records) => {
+                    let entries: Vec<FileEntry> = records
+                        .into_par_iter()
+                        .filter(|(rel, _)| !filter.is_excluded(&root.join(rel), false))
+                        .map(|(rel, rec)| FileEntry::new(root.join(&rel), rel, rec))
+                        .collect();
+                    let mut d = self.data.write();
+                    for e in entries {
+                        d.insert(e);
+                    }
                 }
+                Err(e) => tracing::warn!("index cache load failed: {e}"),
             }
-            Err(e) => tracing::warn!("index cache load failed: {e}"),
         }
         let recent: Vec<PathBuf> = store.load_recent().into_iter().map(|rel| root.join(rel)).collect();
         let mut r = self.recent.lock();
@@ -332,6 +338,9 @@ impl Shared {
     }
 
     fn persist(&self, puts: &[(String, FileRecord)], deletes: &[String], durable: bool) {
+        if !self.symbols_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(store) = &self.store
             && let Err(e) = store.apply(puts, deletes, durable)
         {
@@ -341,7 +350,7 @@ impl Shared {
 
     fn extract(&self, f: &Found, prev_hash: Option<[u8; 32]>) -> Extracted {
         let mut rec = FileRecord { mtime: f.mtime, size: f.size, ignored: f.ignored, ..Default::default() };
-        if f.ignored || f.size > MAX_SYMBOL_FILE {
+        if !self.symbols_enabled.load(Ordering::Relaxed) || f.ignored || f.size > MAX_SYMBOL_FILE {
             return Extracted::New(rec);
         }
         let mut bytes = Vec::with_capacity(f.size as usize);
@@ -378,15 +387,24 @@ impl Shared {
         let mut removed: Vec<PathBuf> = Vec::new();
         let mut save_recent = false;
         let mut rescan = false;
+        let mut symbols = None;
         let mut reparse: Vec<std::sync::Arc<LanguageRegistry>> = Vec::new();
         for job in jobs {
             match job {
                 Job::Changed(p) => changed.extend(p),
                 Job::Removed(p) => removed.extend(p),
                 Job::SaveRecent => save_recent = true,
+                Job::Symbols(enabled) => symbols = Some(enabled),
                 Job::Rescan => rescan = true,
                 Job::Reparse(before) => reparse.push(before),
             }
+        }
+        if let Some(enabled) = symbols
+            && self.symbols_enabled.swap(enabled, Ordering::Relaxed) != enabled
+        {
+            *self.data.write() = IndexData::default();
+            self.load_persisted();
+            rescan = true;
         }
         if rescan {
             // The scan also picks up whatever `changed` / `removed` reported.

@@ -166,7 +166,7 @@ fn find_word(line: &str, word: &str) -> Option<usize> {
     line.match_indices(word).map(|(i, _)| i).find(|&i| {
         let before = line[..i].chars().next_back();
         let after = line[i + word.len()..].chars().next();
-        !(word.starts_with(ident) && before.is_some_and(ident)) && !(word.ends_with(ident) && after.is_some_and(ident))
+        !(word.starts_with(ident) && before.is_some_and(ident) || word.ends_with(ident) && after.is_some_and(ident))
     })
 }
 

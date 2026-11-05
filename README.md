@@ -9,6 +9,8 @@
   The IDE you know, rebuilt in Rust.
 </p>
 
+This fork adds a low-resource mode and an on-demand commit message plugin with configurable OpenAI-compatible endpoints. See [the fork guide](docs/fork-low-resource.md) for setup, tradeoffs and scoped measurements.
+
 <p align="center">
   <a href="https://github.com/l0ng-ai/openidea/releases/latest"><b>Download</b></a>
   &nbsp;·&nbsp;

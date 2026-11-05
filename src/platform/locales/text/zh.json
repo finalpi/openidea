@@ -2862,7 +2862,6 @@
   "Cannot rename project": "无法重命名项目",
   "Power Save Mode": "省电模式",
   "Cannot change Power Save Mode": "无法更改省电模式",
-  "Power save mode is on: completion and documentation popups and usage highlighting are off.": "省电模式已开启：补全和文档弹出窗口以及用法高亮显示已关闭。",
   "This needs the desktop app": "此功能需要桌面应用",
   "Turn Off": "关闭",
   "Build Tools": "构建工具",
@@ -6245,5 +6244,14 @@
   "Connect a device over USB, or start an emulator. Logcat uses the Android SDK's adb.": "通过 USB 连接设备，或启动模拟器。Logcat 使用 Android SDK 的 adb。",
   "No lines match the filter": "没有符合过滤条件的日志行",
   "Streaming": "正在接收",
-  "Idle": "空闲"
+  "Idle": "空闲",
+  "Commit Message Generators": "提交信息生成器",
+  "Generate Commit Message from Staged Changes": "根据暂存区生成提交信息",
+  "Generating commit message…": "正在生成提交信息…",
+  "Generate from staged changes": "根据暂存区生成",
+  "Commit message generators": "提交信息生成器",
+  "Install a commit message generator plugin first": "请先安装提交信息生成插件",
+  "The draft or repository changed; generate the message again": "草稿或仓库已变化，请重新生成提交信息",
+  "Could not generate commit message": "无法生成提交信息",
+  "Power save mode is on: language servers, symbol indexing and automatic suggestions are paused. Git and file search remain available.": "省电模式已开启：已暂停语言服务器、符号索引和自动提示。Git 与文件搜索仍可使用。"
 }

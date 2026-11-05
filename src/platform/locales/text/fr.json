@@ -2728,7 +2728,6 @@
   "Cannot rename project": "Impossible de renommer le projet",
   "Power Save Mode": "Mode économie d'énergie",
   "Cannot change Power Save Mode": "Impossible de changer le mode économie d'énergie",
-  "Power save mode is on: completion and documentation popups and usage highlighting are off.": "Le mode économie d'énergie est actif : les fenêtres de complétion et de documentation ainsi que le surlignage des utilisations sont désactivés.",
   "This needs the desktop app": "Cette fonctionnalité nécessite l'application de bureau",
   "Turn Off": "Désactiver",
   "Build Tools": "Outils de build",
