@@ -882,7 +882,7 @@ mod tests {
         model.gradle[0].env.insert("JAVA_HOME".into(), "/external-jdk".into());
         let all = super::plan(&root, &model, super::BuildKind::Build, None, None).unwrap();
         assert_eq!(all.steps[0].cwd, external);
-        assert_eq!(all.steps[0].program, external.join(wrapper).to_string_lossy());
+        assert_eq!(std::path::Path::new(&all.steps[0].program), external.join(wrapper));
         let module = super::plan(&root, &model, super::BuildKind::Rebuild, Some(&source), None).unwrap();
         assert_eq!(module.steps[0].cwd, external);
         assert_eq!(module.steps[0].env["JAVA_HOME"], "/external-jdk");
