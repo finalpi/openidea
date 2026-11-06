@@ -161,10 +161,16 @@ export function registerVcsActions(): () => void {
   const actions: Action[] = [
     {
       id: "vcs.generateCommitMessage",
-      title: "Generate Commit Message from Staged Changes",
+      title: "Generate Commit Message",
       category: "Git",
       when: VCS,
-      run: ({ arg }) => generateCommitMessage(typeof arg === "string" ? arg : undefined),
+      run: ({ arg }) => {
+        const options = arg as { id?: string; source?: "selected" | "staged" } | undefined;
+        return generateCommitMessage(
+          typeof arg === "string" ? arg : options?.id,
+          typeof arg === "object" ? options?.source : undefined,
+        );
+      },
     },
     {
       id: "vcs.operations",

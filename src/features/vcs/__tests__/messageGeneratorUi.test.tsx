@@ -32,12 +32,12 @@ it("offers installed generators and shows loading until the message draft is rea
       runner={{ busy: false, emptyError: false, clearEmptyError: () => {}, canCommit: true, run: async () => {} }}
     />,
   );
-  fireEvent.click(screen.getByRole("button", { name: "Generate from staged changes" }));
+  fireEvent.click(screen.getByRole("button", { name: "Generation options" }));
   fireEvent.click(await screen.findByRole("menuitem", { name: "Offline generator" }));
-  expect(screen.getByRole("button", { name: "Generating commit message…" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Generating…" })).toBeDisabled();
   await act(async () => finish("chore: update files"));
   await waitFor(() =>
     expect(screen.getByRole("textbox", { name: "Commit message" })).toHaveValue("chore: update files"),
   );
-  expect(screen.getByRole("button", { name: "Generate from staged changes" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Generation options" })).toBeEnabled();
 });

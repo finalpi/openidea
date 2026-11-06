@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { allActions, executeAction, isActionEnabled, registerAction } from "@/platform/actions";
 import { getContext, setContext } from "@/platform/context";
 import type { BuildModel, RunConfig } from "@/platform/ipc";
@@ -116,8 +116,11 @@ describe("build tools feature", () => {
         expanded: { maven: new Set(["mvn:pom.xml", "mvn:pom.xml:lifecycle"]), gradle: new Set() },
       }),
     );
-    await executeAction("maven.toggleSkipTests");
     render(<MavenView />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("checkbox", { name: "Skip Tests" }));
+    });
+    expect(screen.getByRole("checkbox", { name: "Skip Tests" })).toBeChecked();
     expect(screen.getByText("Build files changed since the last reload")).toBeTruthy();
     const phase = screen.getByText("package");
     await act(async () => {

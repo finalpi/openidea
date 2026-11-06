@@ -31,7 +31,7 @@
  * from `useT()` in the same file, must exist in `en.json`; otherwise the UI shows the
  * raw key. Keys built at runtime or passed through a helper are not seen.
  */
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
@@ -565,6 +565,14 @@ function needsTranslation(text: string): boolean {
 
 const scan = scanTypeScript();
 scanBackend(scan.literals);
+for (const entry of readdirSync(`${ROOT}plugins/official`, { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue;
+  for (const name of ["plugin.toml", "settings.schema.json"]) {
+    const path = `${ROOT}plugins/official/${entry.name}/${name}`;
+    if (existsSync(path))
+      for (const text of backendLiterals(readFileSync(path, "utf8"))) scan.literals.add(shape(text));
+  }
+}
 
 const catalogs = Object.fromEntries(
   readdirSync(TEXT_DIR)

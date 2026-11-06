@@ -93,6 +93,7 @@ export interface ValidSettings extends WorkflowSettings {
   tools: Record<string, { path: string }>;
   /** Settings › Language Servers, by server name (as the backend sends them). */
   languageServers: Record<string, LanguageServerEntry>;
+  plugins: Record<string, Record<string, unknown>>;
   /** Tools › Agents › Chat: the meters in an agent task's header. */
   agents: Required<AgentSettings>;
 }
@@ -161,6 +162,7 @@ export const DEFAULT_SETTINGS: ValidSettings = {
   spelling: { ideWords: [], projectWords: [], customDictionaries: [] },
   tools: {},
   languageServers: {},
+  plugins: {},
   agents: { showContextUsage: true, showWorkTime: true, showUsageLimits: true, showCost: false },
   ...DEFAULT_WORKFLOW,
 };
@@ -271,6 +273,7 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
         return typeof path === "string" ? [[cmd, { path }]] : [];
       }),
     ),
+    plugins: Object.fromEntries(Object.entries(obj(root.plugins)).map(([id, values]) => [id, { ...obj(values) }])),
     languageServers: Object.fromEntries(
       Object.entries(obj(root.languageServers)).map(([name, ls]) => [name, obj(ls) as LanguageServerEntry]),
     ),

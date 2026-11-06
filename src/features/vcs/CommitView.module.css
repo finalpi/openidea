@@ -103,13 +103,20 @@
 }
 .commitBar {
   flex: none;
-  height: 32px;
+  min-height: 32px;
+  flex-wrap: wrap;
   display: flex;
   align-items: center;
   gap: 4px;
   padding: 0 6px 0 12px;
   white-space: nowrap;
-  overflow: hidden;
+  overflow: visible;
+}
+.generateActions {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-shrink: 0;
 }
 .grow {
   flex: 1;

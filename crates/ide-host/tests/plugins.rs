@@ -246,10 +246,26 @@ fn commit_assistant_reads_a_real_staging_area_without_changing_it() {
     let info = f.install(&package);
     assert_eq!(info.id, "finalpi.commit-assistant");
     assert_eq!(f.host.ui_items("commitMessages").len(), 2);
+    assert!(f.host.ui_items("commitMessages").iter().all(|item| item.decl["supportsSelection"] == true));
     let message = f.run("finalpi.commit-assistant", "generate-offline", Some("{}")).unwrap().unwrap();
     assert!(message.contains("src/notes.txt"));
     assert!(!message.contains(".env"));
     assert_eq!(git(&["diff", "--cached", "--raw"]), before);
+    assert_eq!(git(&["rev-list", "--count", "HEAD"]), b"1\n");
+
+    // The checked-in component also accepts checked, untracked files without staging them.
+    git(&["reset", "--quiet"]);
+    std::fs::write(f.project.join("new.txt"), "new content\n").unwrap();
+    let argument = serde_json::json!({
+        "selection": { "files": [{
+            "repo": f.project.to_str().unwrap(), "path": "new.txt", "text": "new content\n",
+            "staged": false, "deleted": false, "omitted": false
+        }] }
+    });
+    let message = f.run("finalpi.commit-assistant", "generate-offline", Some(&argument.to_string())).unwrap().unwrap();
+    assert!(message.contains("new.txt"));
+    assert!(!message.contains("notes.txt"));
+    assert!(git(&["diff", "--cached", "--name-only"]).is_empty());
     assert_eq!(git(&["rev-list", "--count", "HEAD"]), b"1\n");
 }
 

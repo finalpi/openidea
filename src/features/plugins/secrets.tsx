@@ -85,7 +85,15 @@ function SecretRow({
   );
 }
 
-export function SecretsDetails({ plugin, items }: { plugin: PluginInfo; items: UiItem<SecretDecl>[] }) {
+export function SecretsDetails({
+  plugin,
+  items,
+  onChanged,
+}: {
+  plugin: PluginInfo;
+  items: UiItem<SecretDecl>[];
+  onChanged?: () => void;
+}) {
   const [state, setState] = useState<PluginSecretState[]>([]);
   const refresh = useCallback(() => {
     pluginsBackend()
@@ -102,7 +110,10 @@ export function SecretsDetails({ plugin, items }: { plugin: PluginInfo; items: U
             plugin={plugin}
             decl={decl}
             isSet={state.some((s) => s.name === decl.name && s.set)}
-            onChanged={refresh}
+            onChanged={() => {
+              refresh();
+              onChanged?.();
+            }}
           />
         ))}
       </ul>

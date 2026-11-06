@@ -12,22 +12,12 @@
  * - `fileIcons`: icons for the files a plugin knows, whatever icon theme is in use;
  * - `fileTemplates`: entries of the New menu.
  */
-import { useMemo } from "react";
 import type { PluginInfo } from "@/bindings";
 import { getAction } from "@/platform/actions";
 import { evaluateWhen } from "@/platform/context";
 import { tx } from "@/platform/i18n";
 import { isMacHost, registerExtensionBindings } from "@/platform/keymap";
-import {
-  Checkbox,
-  Input,
-  Select,
-  T,
-  addFileIconProvider,
-  fileIconName,
-  registerExternalIcons,
-  type MenuItem,
-} from "@/ui";
+import { addFileIconProvider, fileIconName, registerExternalIcons, type MenuItem } from "@/ui";
 import { addContributedFileTemplate } from "@/features/templates/files/store";
 import {
   registerEditorKind,
@@ -37,7 +27,6 @@ import {
   registerSettingsPage,
   registerTextEditorWrapper,
   registerToolWindow,
-  useSettingsForm,
   type ContextMenuId,
   type ToolWindowAnchor,
 } from "@/workbench/contributions";
@@ -58,7 +47,7 @@ import {
 import { layoutActions, layoutWrapper } from "./views/editorLayout";
 import { PluginView } from "./views/PluginView";
 import { WebView } from "./views/WebView";
-import styles from "./PluginsPage.module.css";
+import { settingsPage, type SettingsDecl } from "./settingsPage";
 
 // --- menus ------------------------------------------------------------------------
 
@@ -122,96 +111,7 @@ interface StatusDecl {
 
 // --- settings ---------------------------------------------------------------------
 
-export interface SettingSchema {
-  key: string;
-  type: "boolean" | "string" | "number" | "integer";
-  title: string;
-  description?: string | null;
-  default: unknown;
-  options?: string[] | null;
-  multiline?: boolean;
-}
-
-interface SettingsDecl {
-  title: string;
-  properties: SettingSchema[];
-}
-
-type PluginSettings = Record<string, Record<string, unknown>>;
-
-/** `settings` with `key` of `pluginId` set (`null`: back to the default). */
-export function withPluginSetting(
-  settings: PluginSettings | undefined,
-  pluginId: string,
-  key: string,
-  value: unknown,
-): PluginSettings {
-  const own = { ...(settings?.[pluginId] ?? {}) };
-  if (value === null) delete own[key];
-  else own[key] = value;
-  const next = { ...(settings ?? {}) };
-  if (Object.keys(own).length) next[pluginId] = own;
-  else delete next[pluginId];
-  return next;
-}
-
-function SettingControl({ pluginId, s }: { pluginId: string; s: SettingSchema }) {
-  const form = useSettingsForm();
-  const all = form.useValue("plugins") as PluginSettings | undefined;
-  const value = all?.[pluginId]?.[s.key] ?? s.default;
-  const set = (v: unknown) => form.set("plugins", withPluginSetting(all, pluginId, s.key, v === s.default ? null : v));
-  const id = `plugin-setting-${pluginId}-${s.key}`;
-  const description = s.description ? <div className={styles.muted}>{s.description}</div> : null;
-  if (s.type === "boolean")
-    return (
-      <div className={styles.settingRow}>
-        <Checkbox checked={value === true} label={s.title} onChange={set} />
-        {description}
-      </div>
-    );
-  return (
-    <div className={styles.settingRow}>
-      <label htmlFor={id}>{s.title}</label>
-      {s.options ? (
-        <Select
-          aria-label={s.title}
-          value={String(value)}
-          options={s.options.map((o) => ({ value: o, label: o }))}
-          onChange={set}
-        />
-      ) : (
-        <Input
-          id={id}
-          type={s.type === "string" ? "text" : "number"}
-          value={String(value ?? "")}
-          onChange={(e) => {
-            const raw = e.target.value;
-            if (s.type === "string") set(raw);
-            else if (raw.trim() !== "" && Number.isFinite(Number(raw)))
-              set(s.type === "integer" ? Math.trunc(Number(raw)) : Number(raw));
-          }}
-        />
-      )}
-      {description}
-    </div>
-  );
-}
-
-function settingsPage(pluginId: string, decl: SettingsDecl) {
-  return function PluginSettingsPage() {
-    const properties = useMemo(() => decl.properties, []);
-    return (
-      <div className={styles.settingsPage}>
-        <p className={styles.muted}>
-          <T>Settings of the plugin; projects can override them.</T>
-        </p>
-        {properties.map((s) => (
-          <SettingControl key={s.key} pluginId={pluginId} s={s} />
-        ))}
-      </div>
-    );
-  };
-}
+export { withPluginSetting } from "./settingsPage";
 
 /** Settings page id of a plugin (dots nest pages, so they become dashes). */
 export const pluginSettingsPageId = (pluginId: string) => `plugins.${pluginId.replace(/\./g, "-")}`;

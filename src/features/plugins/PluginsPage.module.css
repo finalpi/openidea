@@ -434,3 +434,39 @@
   color: var(--fg-muted);
   font-size: var(--fs-small);
 }
+
+.settingControls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.settingControls > :first-child {
+  flex: 1;
+  min-width: 160px;
+}
+.settingText {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 140px;
+  resize: vertical;
+  padding: 8px;
+  color: var(--fg);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  font: inherit;
+  line-height: 1.5;
+}
+.settingsSecrets {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.promptPreview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  line-height: 1.5;
+}

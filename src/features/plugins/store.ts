@@ -392,12 +392,18 @@ export function commandTitle(pluginId: string, commandId: string): string {
 }
 
 /** Runs a plugin command from an action; failures become notifications. */
-export async function runPluginCommand(pluginId: string, commandId: string, arg: string | null = null) {
+export async function runPluginCommand(
+  pluginId: string,
+  commandId: string,
+  arg: string | null = null,
+  options: { reportErrors?: boolean } = {},
+) {
   const title = commandTitle(pluginId, commandId);
   try {
     return await pluginsBackend().runCommand(pluginId, commandId, arg, editorContext());
   } catch (e) {
     await refreshPlugins();
+    if (options.reportErrors === false) throw e;
     const status = usePlugins.getState().plugins.find((p) => p.id === pluginId)?.status;
     // A trap disables the plugin and the backend already announced why; a
     // consent request opens its own dialog.

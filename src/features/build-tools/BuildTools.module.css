@@ -179,3 +179,17 @@
   color: var(--fg-subtle);
   font-size: var(--fs-small);
 }
+
+.runOptions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 28px;
+  padding: 2px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.runOptions code {
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+}

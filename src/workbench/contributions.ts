@@ -1539,10 +1539,24 @@ export function cloneSourceList(sources = useCloneSources.getState().sources): C
 }
 
 // On-demand commit message generators supplied by plugins. Results are drafts only.
+export interface CommitMessageSelection {
+  files: {
+    path: string;
+    repo: string;
+    text?: string;
+    staged: boolean;
+    deleted: boolean;
+    omitted: boolean;
+    oldPath?: string;
+    excludedHunks?: string[];
+  }[];
+}
+
 export interface CommitMessageGenerator {
   id: string;
   title: string;
-  generate(repo: string | null): Promise<string | null | undefined>;
+  supportsSelection?: boolean;
+  generate(repo: string | null, selection?: CommitMessageSelection): Promise<string | null | undefined>;
 }
 
 export const useCommitMessageGenerators = create<{ generators: ReadonlyMap<string, CommitMessageGenerator> }>(() => ({

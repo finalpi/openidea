@@ -20,17 +20,26 @@
 
 ## 提交信息插件
 
-插件目录：`plugins/official/commit-assistant`，ID 为 `finalpi.commit-assistant`。仓库包含编译好的 `dist/plugin.wasm`，没有后台轮询，也不会自动启动本地模型。
+当前功能需要桌面版 **v0.1.39** 与插件 **0.2.0**。插件目录为 `plugins/official/commit-assistant`，ID 为 `finalpi.commit-assistant`，编译后的组件已随源码保存。
 
-1. 使用本 fork 编译的桌面版，在 Settings → Plugins → Install Plugin from Disk 选择插件目录。也可使用 `openidea-plugin link` 链接该目录。
-2. 在插件设置中填写 **API base URL** 和 **Model**，在 **API Key** 密钥字段中保存 Key。地址支持带或不带 `/v1` 的 OpenAI 兼容接口。
-3. AI 功能需要用户授予插件网络与密钥权限。为支持自定义域名，新增了显式的 `net:*` 权限；它不会自动授予，也不改变其他插件已有的域名限制。
-4. 先把准备提交的改动加入暂存区，再点击提交信息栏的生成按钮，选择 AI 或离线生成。它依据的是暂存区，不是 Changes 里的包含复选框；生成后如重新暂存，请重新生成。
-5. 结果仅填入可编辑草稿，不执行暂存、提交或推送。生成期间编辑草稿或切换仓库时，旧结果会丢弃。动作搜索里的独立插件命令会复制结果到剪贴板，需要剪贴板权限。
+1. 下载本 fork 的桌面安装包与 `finalpi.commit-assistant-0.2.0.oiplugin`，在 Settings → Plugins → Install Plugin from Disk 导入插件。覆盖更新即可，不必先卸载。
+2. 在 Settings → Plugins → Commit Assistant 同一页面填写 API Key、API base URL 和 Model。Key 点击 Save 后立即保存，其他字段点击 Apply / OK 保存。Key 按插件共用，不随 Global / This project 切换。
+3. 点击 Refresh models 后搜索并选择模型；服务不提供 `/models` 时，可手动输入模型 ID。
+4. Test API connection 检查模型列表接口；Test selected model 验证一次实际对话请求，显示状态和耗时。测试使用未应用的页面值，只发送短测试提示，不发送项目文件内容。Preview prompt 在本地显示当前提示词，不调用 API。
+5. 提示词模板可编辑和恢复默认，语言占位符会替换为 Chinese / English，改动列表与差异内容单独发送。
+6. 提交窗口的 Generate message 默认根据勾选改动生成，未跟踪文件、未保存的编辑器文本也可作为上下文。右侧菜单可选择离线生成或仅根据暂存区生成。
 
-AI 请求只在点击时执行，最多 80 个非敏感路径、24,000 字符的 diff 上下文，输出上限 512 tokens，网络超时 30 秒。常见的 `.env`、私钥、证书和含 `secret` / `credential` 的文件名会排除；这不等于完整的秘密检测，发送前仍应检查暂存区。接口默认要求 HTTPS；localhost 可使用 HTTP。
+生成结果只是可编辑草稿。流程不自动保存文件、暂存、提交或推送；生成期间文件、勾选范围或草稿变化时，旧结果会丢弃。独立的插件命令仍以暂存区为来源并复制结果到剪贴板。
 
-Key 由 IDE 的密钥存储管理，不写入普通配置，不放入 Git。缺少配置、网络失败、API 错误或生成期间暂存区变化时，都保留原草稿。离线模式不请求 API，只根据暂存文件名生成基础描述，适合快速填充后自行调整。
+插件仅在点击时执行，不轮询接口，也不启动本地模型进程。默认限制为 80 个文件、24,000 个 diff 字符、512 输出 tokens、30 秒超时。配置允许 1,000–64,000 个 diff 字符、64–2,048 输出 tokens、5–45 秒超时。文件文本快照每个最多 128 KiB，总计最多 256 KiB。
+
+常见 `.env`、私钥、证书及文件名中含 secret / credential 的路径会过滤；二进制、大文件和预算外文件只保留名称，不读取或发送其文件内容，符号链接不读取被指向文件的内容。这些规则不是完整的秘密检测，发送前仍需检查选中文件。API 默认要求 HTTPS，localhost 可使用 HTTP。
+
+API Key 留在 IDE 的专用密钥存储中，不放入普通设置和 Git，不返回给设置页面或插件代码。使用 AI 时需在插件详情页授予网络及密钥权限。`net:*` 用于自定义 API 域名，必须由用户明确授予，不自动放开其他插件已有的域名限制。
+
+## Maven 跳过测试
+
+在 Maven 工具窗口的文字勾选项 **Skip Tests** 开启。执行 `package` 等 Maven goal 时会追加 `-DskipTests`，选项按项目保存；手动指定的同名参数优先。此参数跳过测试执行，通常仍会编译测试代码。该开关复用现有行为，本版只改进可见性。
 
 ## 测量与验证
 
@@ -58,11 +67,11 @@ cargo build -p ide-index --example resource_probe
 
 结果包含各次原始样本。比较整个 IDE 时，应使用 Release 构建，并统计它的全部子进程；可参考上游 `perf/compare`。
 
-## 已完成的检查
+## v0.1.39 已完成的检查
 
-- 前端完整测试：606 个文件通过，6,582 项通过、6 项跳过；新增生成按钮交互测试另行通过。
+- 前端测试覆盖 610 个文件，6,592 项通过、6 项跳过。全套首轮的四项失败在统一生成文件换行和单独复测后通过，没有修改测试断言。
 - `pnpm typecheck`、`pnpm build`、`pnpm lint`、`pnpm knip` 通过；lint 保留上游已有告警。
-- Rust 全工作区与所有 target 的严格 Clippy、Rustfmt 通过。
-- 原生 Wasm 插件对真实 Git 暂存区的集成测试通过：只读取改动，不修改暂存区或创建提交。
-- Windows 桌面版运行验证通过：离线结果填入提交草稿，省电模式下语言服务器列表为空、符号数为零。AI 请求使用模拟响应测试，没有使用真实 Key 调用服务。
+- Rust 宿主 crate 所有 target 的严格 Clippy、全工作区 Rustfmt 通过；插件独立工作区的 Clippy、12 项单元测试和 Wasm 构建通过。
+- 原生 Wasm 插件对真实 Git 仓库的集成测试覆盖暂存区和未跟踪文件：只读取改动，不修改暂存区或创建提交。
+- Windows 桌面版运行验证通过：同页设置 Key、刷新并选择模型、使用未应用的配置测试 API、预览提示词，以及将未暂存文件生成的结果填入提交草稿。Maven 勾选开关后的 package 参数包含 `-DskipTests`。API 使用本机模拟服务及临时测试 Key，没有调用真实付费服务。
 - 对应 LF 源码快照的 Oxfmt 检查通过。Windows 的 CRLF 检出及符号链接占位文件会影响本机全目录格式检查；没有把这些差异作为源码改动提交。

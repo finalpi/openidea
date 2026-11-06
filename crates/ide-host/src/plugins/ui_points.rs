@@ -66,9 +66,12 @@ pub const FILE_TEMPLATES: &str = "fileTemplates";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct CommitMessageDecl {
     command: String,
     title: String,
+    #[serde(default)]
+    supports_selection: bool,
 }
 
 pub(super) fn commit_message(pkg: &Package, decl: toml::Value) -> Result<UiDecl, String> {
@@ -253,6 +256,15 @@ struct SettingsDecl {
 #[derive(Debug, Deserialize)]
 struct SchemaFile {
     properties: serde_json::Map<String, Value>,
+    #[serde(default)]
+    actions: Vec<SettingsAction>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsAction {
+    command: String,
+    title: String,
 }
 
 /// One setting of a plugin.
@@ -271,6 +283,12 @@ pub struct SettingSchema {
     pub options: Option<Vec<String>>,
     #[serde(default)]
     pub multiline: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices_dependencies: Option<Vec<String>>,
+    #[serde(default)]
+    pub order: i32,
 }
 
 impl SettingSchema {
@@ -323,6 +341,22 @@ fn setting(key: &str, raw: &Value) -> Result<SettingSchema, String> {
         default,
         options,
         multiline: o.get("multiline").and_then(Value::as_bool).unwrap_or(false),
+        choices_command: text("choicesCommand", 128)?,
+        choices_dependencies: o
+            .get("choicesDependencies")
+            .map(|v| {
+                let list = v
+                    .as_array()
+                    .filter(|a| a.len() <= 16)
+                    .ok_or_else(|| format!("setting {key}: choicesDependencies lists up to 16 keys"))?;
+                list.iter()
+                    .map(|v| {
+                        v.as_str().map(str::to_owned).ok_or_else(|| "choicesDependencies lists strings".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?,
+        order: o.get("order").and_then(Value::as_i64).unwrap_or(0).clamp(-1000, 1000) as i32,
     };
     if !s.accepts(&s.default) {
         return Err(format!("setting {key:?}: the default does not match its type"));
@@ -336,17 +370,45 @@ pub fn parse_settings_schema(text: &str) -> Result<Vec<SettingSchema>, String> {
     if file.properties.len() > MAX_SETTINGS {
         return Err(format!("more than {MAX_SETTINGS} settings"));
     }
-    file.properties.iter().map(|(k, v)| setting(k, v)).collect()
+    let mut properties = file.properties.iter().map(|(k, v)| setting(k, v)).collect::<Result<Vec<_>, _>>()?;
+    properties.sort_by_key(|s| s.order);
+    Ok(properties)
 }
 
 pub(super) fn settings(pkg: &Package, decl: toml::Value) -> Result<UiDecl, String> {
     let d: SettingsDecl = decode(SETTINGS, decl)?;
     let text = pkg.read_text(&d.schema)?;
     let properties = parse_settings_schema(&text).map_err(|e| format!("{}: {e}", d.schema.display()))?;
+    let file: SchemaFile = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if file.actions.len() > 8 {
+        return Err("at most 8 settings actions".into());
+    }
+    for property in &properties {
+        if let Some(command) = &property.choices_command {
+            if property.kind != "string" || property.options.is_some() {
+                return Err("choicesCommand needs a free string setting".into());
+            }
+            declared_command(pkg, SETTINGS, command)?;
+        }
+    }
+    for property in &properties {
+        for dependency in property.choices_dependencies.iter().flatten() {
+            if !properties.iter().any(|p| &p.key == dependency) {
+                return Err(format!("unknown choices dependency {dependency}"));
+            }
+        }
+    }
+    for action in &file.actions {
+        declared_command(pkg, SETTINGS, &action.command)?;
+        title_ok(&action.title)?;
+    }
     let title = d.title.unwrap_or_else(|| pkg.manifest.name.clone());
     title_ok(&title)?;
-    let mut decl =
-        UiDecl::new("settings", title.clone(), serde_json::json!({ "title": title, "properties": properties }));
+    let mut decl = UiDecl::new(
+        "settings",
+        title.clone(),
+        serde_json::json!({ "title": title, "properties": properties, "actions": file.actions }),
+    );
     decl.files.push(d.schema);
     Ok(decl)
 }

@@ -8,6 +8,7 @@ const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig(() => ({
   plugins: [react()],
+  cacheDir: process.env.OPENIDEA_VITE_CACHE_DIR || undefined,
   resolve: {
     alias: [
       { find: "@", replacement: fileURLToPath(new URL("./src", import.meta.url)) },

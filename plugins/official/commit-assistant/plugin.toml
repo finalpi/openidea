@@ -1,7 +1,7 @@
 id = "finalpi.commit-assistant"
 name = "Commit Assistant"
-version = "0.1.0"
-description = "Generate a commit message from staged changes, offline or with your OpenAI-compatible API. Runs only when requested."
+version = "0.2.0"
+description = "Generate a commit message from selected or staged changes, offline or with your OpenAI-compatible API. Runs only when requested."
 authors = ["finalpi"]
 license = "Apache-2.0"
 categories = ["vcs", "ai"]
@@ -15,23 +15,25 @@ optional = ["net:*", "secrets", "clipboard"]
 
 [[contributes.commands]]
 id = "generate-ai"
-title = "Generate Commit Message with AI (Staged Changes)"
+title = "Commit Assistant: Generate from Git Staging with AI"
 category = "Git"
 when = "vcsAvailable"
 
 [[contributes.commands]]
 id = "generate-offline"
-title = "Generate Commit Message Offline (Staged Changes)"
+title = "Commit Assistant: Generate from Git Staging Offline"
 category = "Git"
 when = "vcsAvailable"
 
 [[contributes.commitMessages]]
 command = "generate-ai"
-title = "Generate with AI (staged changes)"
+title = "Generate with AI"
+supportsSelection = true
 
 [[contributes.commitMessages]]
 command = "generate-offline"
-title = "Generate offline (staged changes)"
+title = "Generate offline"
+supportsSelection = true
 
 [[contributes.secrets]]
 name = "api-key"
@@ -41,3 +43,23 @@ description = "Sent only to the endpoint you configure, when you choose AI gener
 [contributes.settings]
 title = "Commit Assistant"
 schema = "settings.schema.json"
+
+[[contributes.commands]]
+id = "list-models"
+title = "Commit Assistant: List API Models"
+category = "Git"
+
+[[contributes.commands]]
+id = "test-api"
+title = "Commit Assistant: Test API Connection"
+category = "Git"
+
+[[contributes.commands]]
+id = "test-model"
+title = "Commit Assistant: Test Selected Model"
+category = "Git"
+
+[[contributes.commands]]
+id = "preview-prompt"
+title = "Commit Assistant: Preview Prompt"
+category = "Git"

@@ -117,6 +117,28 @@ pub(super) fn net_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+fn request_failed(error: reqwest::Error) -> HostError {
+    if error.is_timeout() {
+        return HostError::Failed("HTTP request timed out".into());
+    }
+    let mut detail = error.to_string().to_ascii_lowercase();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        detail.push_str(&cause.to_string().to_ascii_lowercase());
+        source = cause.source();
+    }
+    let message = if detail.contains("certificate") || detail.contains("tls") || detail.contains("ssl") {
+        "TLS or certificate validation failed"
+    } else if detail.contains("dns") || detail.contains("resolve") || detail.contains("lookup address") {
+        "DNS resolution failed"
+    } else if error.is_connect() {
+        "HTTP connection failed"
+    } else {
+        "HTTP request or response failed"
+    };
+    HostError::Failed(message.into())
+}
+
 /// Replaces `{{secret:<name>}}` in `value` with the plugin's secrets.
 fn fill_secrets(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, HostError> {
     let mut out = String::with_capacity(value.len());
@@ -506,7 +528,7 @@ impl HostApi for PluginApi {
         let host = ide_plugin::net_host(&request.url).map_err(HostError::Invalid)?;
         net_runtime().block_on(async move {
             let send = async {
-                let response = builder.send().await.map_err(|e| HostError::Failed(e.to_string()))?;
+                let response = builder.send().await.map_err(request_failed)?;
                 if ide_plugin::net_host(response.url().as_str()).ok().as_deref() != Some(host.as_str()) {
                     return Err(HostError::Denied(format!(
                         "net:{} (redirected)",
@@ -521,7 +543,7 @@ impl HostApi for PluginApi {
                     .collect();
                 let mut body = Vec::new();
                 let mut response = response;
-                while let Some(chunk) = response.chunk().await.map_err(|e| HostError::Failed(e.to_string()))? {
+                while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
                     if body.len() + chunk.len() > MAX_RESPONSE {
                         return Err(HostError::Failed("response larger than 8 MiB".into()));
                     }
@@ -881,5 +903,31 @@ mod credential_tests {
         }
         assert!(matches!(from_window(None, "open a URL"), Err(HostError::Invalid(_))));
         assert_eq!(from_window(Some("main"), "open a URL").unwrap(), "main");
+    }
+}
+
+#[cfg(test)]
+mod transport_error_tests {
+    use super::*;
+    #[tokio::test]
+    async fn network_errors_do_not_echo_url_credentials_or_query_values() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = ide_http::client::build(&ide_core::proxy_settings::ProxySettings {
+            mode: ide_core::proxy_settings::ProxyMode::None,
+            ..Default::default()
+        })
+        .unwrap();
+        let error = client
+            .get(format!("http://127.0.0.1:{port}/?key=fake-sensitive-value"))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .unwrap_err();
+        let message = format!("{:?}", request_failed(error));
+        assert!(!message.contains("fake-sensitive-value"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(message.contains("connection") || message.contains("timed out"));
     }
 }

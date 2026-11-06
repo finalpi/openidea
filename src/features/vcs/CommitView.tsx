@@ -833,32 +833,56 @@ export function CommitMessageField({ included, runner }: { included: number; run
             },
           }))}
         />
-        {generators.size > 0 && (
-          <>
-            <IconButton
-              ref={generateRef}
-              icon={generating ? "spinner" : "lightbulb"}
-              title={generating ? "Generating commit message…" : "Generate from staged changes"}
-              size="small"
-              disabled={generating}
-              aria-haspopup="menu"
-              aria-expanded={generatorsOpen}
-              onClick={() => setGeneratorsOpen((open) => !open)}
-            />
-            <Menu
-              open={generatorsOpen}
-              onClose={() => setGeneratorsOpen(false)}
-              anchor={generateRef}
-              placement="bottom-end"
-              aria-label="Commit message generators"
-              items={[...generators.values()].map((generator) => ({
-                id: generator.id,
-                label: generator.title,
-                run: () => void executeAction("vcs.generateCommitMessage", generator.id),
-              }))}
-            />
-          </>
-        )}
+        <div className={styles.generateActions}>
+          <Button
+            icon={generating ? "spinner" : "diff-magic"}
+            title={
+              generating
+                ? "Generating commit message…"
+                : [...generators.values()][0]?.supportsSelection
+                  ? "Generate a draft from selected changes"
+                  : "Generate from Git staging area"
+            }
+            size="small"
+            disabled={generating || generators.size === 0}
+            onClick={() => void executeAction("vcs.generateCommitMessage")}
+          >
+            <T>{generating ? "Generating…" : "Generate message"}</T>
+          </Button>
+          <IconButton
+            ref={generateRef}
+            icon="chevron-down"
+            title="Generation options"
+            size="small"
+            disabled={generating || generators.size === 0}
+            aria-haspopup="menu"
+            aria-expanded={generatorsOpen}
+            onClick={() => setGeneratorsOpen((open) => !open)}
+          />
+          <Menu
+            open={generatorsOpen}
+            onClose={() => setGeneratorsOpen(false)}
+            anchor={generateRef}
+            placement="bottom-end"
+            aria-label="Commit message generators"
+            items={[
+              { kind: "header", label: "Selected changes (including untracked files)" },
+              ...[...generators.values()]
+                .filter((g) => g.supportsSelection)
+                .map((g) => ({
+                  id: `${g.id}.selected`,
+                  label: g.title,
+                  run: () => void executeAction("vcs.generateCommitMessage", { id: g.id, source: "selected" }),
+                })),
+              { kind: "header", label: "Git staging area only" },
+              ...[...generators.values()].map((g) => ({
+                id: `${g.id}.staged`,
+                label: g.title,
+                run: () => void executeAction("vcs.generateCommitMessage", { id: g.id, source: "staged" }),
+              })),
+            ]}
+          />
+        </div>
         <span className={styles.grow} />
         {tooLong && (
           <span className={clsx(styles.lineLen, styles.lineLenWarn)} title={tx("Subject line length")}>

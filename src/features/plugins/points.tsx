@@ -137,13 +137,15 @@ function IconThemesDetails({ plugin, items }: { plugin: PluginInfo; items: UiIte
 /** Registers the client side of every first-party UI point. */
 export function defineBuiltinUiPoints(): () => void {
   const disposers = [
-    defineUiPoint<{ command: string; title: string }>("commitMessages", {
+    defineUiPoint<{ command: string; title: string; supportsSelection?: boolean }>("commitMessages", {
       title: "Commit Message Generators",
       project: ({ pluginId, decl }) =>
         registerCommitMessageGenerator({
           id: pluginActionId(pluginId, decl.command),
           title: decl.title,
-          generate: (repo) => runPluginCommand(pluginId, decl.command, JSON.stringify({ repo })),
+          supportsSelection: decl.supportsSelection,
+          generate: (repo, selection) =>
+            runPluginCommand(pluginId, decl.command, JSON.stringify({ repo, selection }), { reportErrors: false }),
         }),
     }),
     defineUiPoint<CommandDecl>("commands", {

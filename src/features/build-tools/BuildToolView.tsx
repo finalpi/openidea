@@ -1,3 +1,4 @@
+import { executeAction } from "@/platform/actions";
 /** The Maven and Gradle tool windows: toolbar, status banner and the project tree. */
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import clsx from "clsx";
@@ -131,57 +132,66 @@ function Toolbar({ tool, selection }: { tool: BuildTool; selection: BuildNode[] 
   };
   const maven = tool === "maven";
   return (
-    <div className={styles.toolbar} role="toolbar" aria-label={maven ? "Maven actions" : "Gradle actions"}>
-      {syncing ? (
-        <IconButton icon="stop" size="small" iconSize={16} action={`${tool}.cancelReload`} />
-      ) : (
-        <IconButton icon="refresh" size="small" iconSize={16} action={`${tool}.reload`} />
-      )}
-      <IconButton icon="plus" size="small" iconSize={16} action={maven ? "maven.addProjects" : "gradle.linkProjects"} />
-      <span className={styles.sep} />
-      <IconButton
-        icon="run"
-        size="small"
-        iconSize={16}
-        title={maven ? "Run Maven Build" : "Run Gradle Task"}
-        disabled={!config}
-        onClick={runSelected}
-      />
-      <IconButton
-        icon="run-anything"
-        size="small"
-        iconSize={16}
-        action={maven ? "maven.executeGoal" : "gradle.executeTask"}
-      />
-      <IconButton
-        icon="build-offline"
-        size="small"
-        iconSize={16}
-        action={`${tool}.toggleOffline`}
-        pressed={maven ? settings.maven.offline : settings.gradle.offline}
-      />
-      <IconButton
-        icon="build-dependencies"
-        size="small"
-        iconSize={16}
-        action={maven ? "maven.analyzeDependencies" : "gradle.analyzeDependencies"}
-      />
-      {maven && (
+    <>
+      <div className={styles.toolbar} role="toolbar" aria-label={maven ? "Maven actions" : "Gradle actions"}>
+        {syncing ? (
+          <IconButton icon="stop" size="small" iconSize={16} action={`${tool}.cancelReload`} />
+        ) : (
+          <IconButton icon="refresh" size="small" iconSize={16} action={`${tool}.reload`} />
+        )}
         <IconButton
-          icon="skip-tests"
+          icon="plus"
           size="small"
           iconSize={16}
-          action="maven.toggleSkipTests"
-          pressed={settings.maven.skipTests}
+          action={maven ? "maven.addProjects" : "gradle.linkProjects"}
         />
-      )}
-      <span className={styles.sep} />
-      <IconButton icon="expand-all" size="small" iconSize={16} action={`${tool}.expandAll`} />
-      <IconButton icon="collapse-all" size="small" iconSize={16} action={`${tool}.collapseAll`} />
+        <span className={styles.sep} />
+        <IconButton
+          icon="run"
+          size="small"
+          iconSize={16}
+          title={maven ? "Run Maven Build" : "Run Gradle Task"}
+          disabled={!config}
+          onClick={runSelected}
+        />
+        <IconButton
+          icon="run-anything"
+          size="small"
+          iconSize={16}
+          action={maven ? "maven.executeGoal" : "gradle.executeTask"}
+        />
+        <IconButton
+          icon="build-offline"
+          size="small"
+          iconSize={16}
+          action={`${tool}.toggleOffline`}
+          pressed={maven ? settings.maven.offline : settings.gradle.offline}
+        />
+        <IconButton
+          icon="build-dependencies"
+          size="small"
+          iconSize={16}
+          action={maven ? "maven.analyzeDependencies" : "gradle.analyzeDependencies"}
+        />
+
+        <span className={styles.sep} />
+        <IconButton icon="expand-all" size="small" iconSize={16} action={`${tool}.expandAll`} />
+        <IconButton icon="collapse-all" size="small" iconSize={16} action={`${tool}.collapseAll`} />
+        {maven && (
+          <IconButton icon="settings" size="small" iconSize={16} action="maven.settings" title="Maven Settings…" />
+        )}
+      </div>
       {maven && (
-        <IconButton icon="settings" size="small" iconSize={16} action="maven.settings" title="Maven Settings…" />
+        <div className={styles.runOptions} role="group" aria-label="Maven run options">
+          <Checkbox
+            checked={settings.maven.skipTests}
+            label="Skip Tests"
+            onChange={() => void executeAction("maven.toggleSkipTests")}
+          />
+          <code>-DskipTests</code>
+        </div>
       )}
-    </div>
+    </>
   );
 }
 
