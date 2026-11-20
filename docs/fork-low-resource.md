@@ -20,7 +20,7 @@
 
 ## 提交信息插件
 
-当前版本需要桌面版 **v0.1.50** 与插件 **0.2.1**。插件目录为 `plugins/official/commit-assistant`，ID 为 `finalpi.commit-assistant`，编译后的组件已随源码保存。
+当前版本需要桌面版 **v0.1.51** 与插件 **0.2.1**。插件目录为 `plugins/official/commit-assistant`，ID 为 `finalpi.commit-assistant`，编译后的组件已随源码保存。
 
 1. 下载本 fork 的桌面安装包与 `finalpi.commit-assistant-0.2.1.oiplugin`，在 Settings → Plugins → Install Plugin from Disk 覆盖安装插件。
 2. 在 Settings → Plugins → Commit Assistant 同一页面填写 API Key、API base URL 和 Model。Key 点击 Save 后立即保存，其他字段点击 Apply / OK 保存。Key 按插件共用，不随 Global / This project 切换。
