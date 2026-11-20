@@ -6,6 +6,8 @@
 import { useEffect } from "react";
 import { create } from "zustand";
 import { editorsFor, useEditorRegistry } from "@/editor/api";
+import { onLspRefresh } from "@/editor/lsp/availability";
+import { projectPythonHierarchy, pythonSupertypeItems } from "@/editor/navigation/pythonHierarchy";
 import { call, commands, IpcError, type OutlineItem, type Pos } from "@/platform/ipc";
 import { isVirtualUri } from "@/platform/virtualDocs";
 import { loadJson, saveJson } from "../common/open";
@@ -16,6 +18,8 @@ interface OutlineState {
   path: string | null;
   doc: number | null;
   items: OutlineItem[] | null;
+  /** The Dart server's widget tree of a Flutter file; the Structure view prefers it over `items`. */
+  flutter: OutlineItem[] | null;
   loading: boolean;
   error: string | null;
   /** Whether the file's language server answers type hierarchy requests (Show Inherited is offered). */
@@ -28,6 +32,7 @@ export const useOutline = create<OutlineState>(() => ({
   path: null,
   doc: null,
   items: null,
+  flutter: null,
   loading: false,
   error: null,
   inheritedSupported: false,
@@ -38,6 +43,7 @@ const IDLE_MS = 500;
 let consumers = 0;
 let stop: (() => void) | null = null;
 let seq = 0;
+let flutterSeq = 0;
 
 /** A backend document id for `path` while `fn` runs (open editors are reused). */
 async function withDoc<T>(path: string, fn: (doc: number) => Promise<T>): Promise<T> {
@@ -53,8 +59,16 @@ async function withDoc<T>(path: string, fn: (doc: number) => Promise<T>): Promis
 
 const supertypesOf = (doc: number, pos: Pos) => call(commands.lspTypeHierarchy(doc, pos, "incoming"));
 
-export const inheritedDeps = (path: string, doc: number): InheritedDeps => ({
-  supertypes: (p, pos) => (p === path ? supertypesOf(doc, pos) : withDoc(p, (d) => supertypesOf(d, pos))),
+/** Python's supertypes: its servers declare no `typeHierarchyProvider`, the IDE's graph answers instead. */
+async function pythonSupertypesOf(path: string, pos: Pos) {
+  const hierarchy = await projectPythonHierarchy().catch(() => null);
+  return hierarchy ? pythonSupertypeItems(hierarchy, path, pos) : [];
+}
+
+export const inheritedDeps = (path: string, doc: number, python = false): InheritedDeps => ({
+  supertypes: python
+    ? (p, pos) => pythonSupertypesOf(p, pos)
+    : (p, pos) => (p === path ? supertypesOf(doc, pos) : withDoc(p, (d) => supertypesOf(d, pos))),
   outline: (p) => (p === path ? call(commands.docOutline(doc)) : withDoc(p, (d) => call(commands.docOutline(d)))),
 });
 
@@ -70,17 +84,23 @@ async function probeHierarchy(doc: number, types: readonly OutlineItem[]): Promi
   }
 }
 
-async function loadInherited(doc: number, path: string, items: readonly OutlineItem[], my: number) {
+async function loadInherited(doc: number, path: string, items: readonly OutlineItem[], my: number, language: string) {
   const types = typesIn(items);
-  // Probed once per file; a reload after edits keeps the answer.
+  // Probed once per file; a reload after edits keeps the answer. Python needs no probe: the
+  // graph answers its supertypes while its servers declare no type hierarchy.
   const known = useOutline.getState();
-  const supported = known.path === path && known.inheritedSupported ? true : await probeHierarchy(doc, types);
+  const supported =
+    language === "python"
+      ? types.length > 0
+      : known.path === path && known.inheritedSupported
+        ? true
+        : await probeHierarchy(doc, types);
   if (my !== seq) return;
   if (!supported || !useStructureOptions.getState().showInherited) {
     useOutline.setState({ inheritedSupported: supported, inherited: null });
     return;
   }
-  const deps = inheritedDeps(path, doc);
+  const deps = inheritedDeps(path, doc, language === "python");
   const entries = await Promise.all(
     types.map(async (t) => [typeKey(t), await inheritedMembers(path, t, deps).catch(() => [])] as const),
   );
@@ -88,18 +108,34 @@ async function loadInherited(doc: number, path: string, items: readonly OutlineI
     useOutline.setState({ inheritedSupported: true, inherited: new Map(entries.filter(([, m]) => m.length)) });
 }
 
-async function load(doc: number, path: string) {
+async function loadFlutter(doc: number, language: string) {
+  const my = ++flutterSeq;
+  const flutter = language === "dart" ? await call(commands.docFlutterOutline(doc)).catch(() => null) : null;
+  if (my === flutterSeq) useOutline.setState({ flutter });
+}
+
+async function load(doc: number, path: string, language: string) {
   const my = ++seq;
   useOutline.setState((s) =>
     s.path === path
       ? { loading: true }
-      : { path, doc, items: null, loading: true, error: null, inheritedSupported: false, inherited: null },
+      : {
+          path,
+          doc,
+          items: null,
+          flutter: null,
+          loading: true,
+          error: null,
+          inheritedSupported: false,
+          inherited: null,
+        },
   );
+  void loadFlutter(doc, language);
   try {
     const items = await call(commands.docOutline(doc));
     if (my !== seq) return;
     useOutline.setState({ path, doc, items, loading: false, error: null });
-    void loadInherited(doc, path, items, my);
+    void loadInherited(doc, path, items, my, language);
   } catch (e) {
     if (my === seq) useOutline.setState({ path, doc, loading: false, error: String((e as Error)?.message ?? e) });
   }
@@ -113,10 +149,12 @@ function start(): () => void {
     const ctx = current();
     if (!ctx) {
       seq++;
+      flutterSeq++;
       useOutline.setState({
         path: null,
         doc: null,
         items: null,
+        flutter: null,
         loading: false,
         error: null,
         inheritedSupported: false,
@@ -124,7 +162,7 @@ function start(): () => void {
       });
       return;
     }
-    void load(ctx.doc, ctx.path);
+    void load(ctx.doc, ctx.path, ctx.language);
   };
   reloadNow();
   const unsubActive = useEditorRegistry.subscribe((s, prev) => {
@@ -139,8 +177,15 @@ function start(): () => void {
     clearTimeout(timer);
     timer = setTimeout(reloadNow, IDLE_MS);
   });
+  // Published after each analysis, independently of the requests above.
+  const unsubFlutter = onLspRefresh("flutterOutline", () => {
+    const ctx = current();
+    if (ctx) void loadFlutter(ctx.doc, ctx.language);
+  });
   return () => {
     clearTimeout(timer);
+    flutterSeq++;
+    unsubFlutter();
     unsubActive();
     unsubInherited();
     unsubEdits();
@@ -178,6 +223,8 @@ interface StructureOptions {
   sortByVisibility: boolean;
   /** Members inherited from supertypes, greyed (IDEA: off). */
   showInherited: boolean;
+  /** Flutter outline: hide declarations without widgets (Flutter plugin: off). */
+  showOnlyWidgets: boolean;
 }
 
 export const useStructureOptions = create<StructureOptions>(() => ({
@@ -189,6 +236,7 @@ export const useStructureOptions = create<StructureOptions>(() => ({
   showNonPublic: true,
   sortByVisibility: false,
   showInherited: false,
+  showOnlyWidgets: false,
   ...loadJson<Partial<StructureOptions>>(OPTIONS_KEY, {}),
 }));
 
@@ -202,5 +250,6 @@ useStructureOptions.subscribe((s) =>
     showNonPublic: s.showNonPublic,
     sortByVisibility: s.sortByVisibility,
     showInherited: s.showInherited,
+    showOnlyWidgets: s.showOnlyWidgets,
   }),
 );

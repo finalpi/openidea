@@ -13,6 +13,10 @@ interface Hint {
   /** Text, or DOM built when shown (with `destroy` when it holds e.g. a React root). */
   content: string | (() => HTMLElement | { dom: HTMLElement; destroy: () => void });
   tone: "info" | "error" | "warning";
+  /** Progress of a request still running (`data-pending` on the hint). */
+  pending?: boolean;
+  /** `data-*` attributes saying what the hint answers, for tests and tools. */
+  data?: Record<string, string>;
 }
 
 const setHint = StateEffect.define<Hint | null>();
@@ -31,10 +35,17 @@ const hintField = StateField.define<Hint | null>({
             pos: h.pos,
             above: true,
             strictSide: false,
-            create: () => {
+            create: (view) => {
               const dom = document.createElement("div");
               dom.className = `cm-lsp-hint cm-lsp-hint-${h.tone}`;
+              // Clicked or focused (a value tree expanded in it): the user works in the hint, so
+              // it stays until an edit, a caret move or Escape.
+              const keep = () => clearTimeout(timers.get(view));
+              dom.addEventListener("pointerdown", keep);
+              dom.addEventListener("focusin", keep);
               dom.setAttribute("role", "status");
+              if (h.pending) dom.dataset.pending = "true";
+              Object.assign(dom.dataset, h.data);
               if (typeof h.content === "string") {
                 dom.textContent = txTemplate(h.content);
                 return { dom };
@@ -57,20 +68,29 @@ const timers = new WeakMap<EditorView, ReturnType<typeof setTimeout>>();
 export function showHint(
   view: EditorView,
   content: Hint["content"],
-  opts: { pos?: number; tone?: Hint["tone"]; timeout?: number } = {},
+  /** `timeout: null`: the hint stays until an edit, a caret move or Escape. */
+  opts: { pos?: number; tone?: Hint["tone"]; timeout?: number | null; pending?: boolean; data?: Hint["data"] } = {},
 ) {
   const pos = opts.pos ?? view.state.selection.main.head;
-  const effects: StateEffect<unknown>[] = [setHint.of({ pos, content, tone: opts.tone ?? "info" })];
+  const effects: StateEffect<unknown>[] = [
+    setHint.of({ pos, content, tone: opts.tone ?? "info", pending: opts.pending, data: opts.data }),
+  ];
   if (!view.state.field(hintField, false)) effects.push(StateEffect.appendConfig.of(hintExtension()));
   view.dispatch({ effects });
   clearTimeout(timers.get(view));
+  if (opts.timeout === null) return;
   timers.set(
     view,
-    setTimeout(() => {
-      if (view.dom.isConnected && view.state.field(hintField, false)) view.dispatch({ effects: setHint.of(null) });
-    }, opts.timeout ?? 4000),
+    // Also while the view is hidden: it would show the hint again when its tab is shown.
+    setTimeout(() => hideHint(view), opts.timeout ?? 4000),
   );
 }
+
+/**
+ * How long a request runs before its pending hint shows: past the answers that come at once,
+ * within the 100 ms a user waits for any sign that something is happening.
+ */
+export const PENDING_HINT_DELAY_MS = 50;
 
 /** Show progress only for slow requests; the disposer removes only its own hint. */
 export function showPendingHint(view: EditorView, content: string): () => void {
@@ -85,14 +105,15 @@ export function showPendingHint(view: EditorView, content: string): () => void {
       view.state.field(hintField, false) !== previous
     )
       return;
-    showHint(view, content, { timeout: 30_000 });
+    showHint(view, content, { timeout: 30_000, pending: true });
     shown = view.state.field(hintField);
-  }, 250);
+  }, PENDING_HINT_DELAY_MS);
   return () => {
     clearTimeout(timer);
+    // Also when the request ended by opening another tab, which hid this view.
     if (shown && view.state.field(hintField, false) === shown) {
       clearTimeout(timers.get(view));
-      if (view.dom.isConnected) hideHint(view);
+      hideHint(view);
     }
   };
 }

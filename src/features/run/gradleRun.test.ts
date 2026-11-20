@@ -1,16 +1,24 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GradleModel, ProjectInfo, RunConfig } from "@/platform/ipc";
+import * as ipc from "@/platform/ipc";
 import { applicationConfig } from "./application";
 import {
+  DELEGATED_ATTACH_LISTENER,
   DELEGATED_DEBUG,
   delegatedGradleConfig,
   gradleDelegation,
+  gradleBootLaunch,
+  gradleTestLaunch,
   withTestEvents,
   wrapperGradleVersion,
 } from "./gradleRun";
 import { jdwpLaunch } from "./javaDebug";
+import RUN_SCRIPT from "./gradleRun.gradle?raw";
 import { isJvmApplication } from "@/platform/javaLaunch";
+import TESTS_SCRIPT from "./gradleTests.gradle?raw";
+import BOOT_SCRIPT from "./gradleBoot.gradle?raw";
 import { useBuildModel } from "@/platform/buildModel";
+import { usePlatform } from "@/platform/platformInfo";
 import { useProject } from "@/platform/project";
 
 vi.mock("@/platform/ipc", async (original) => {
@@ -135,6 +143,16 @@ describe("Build and run using: Gradle", () => {
     expect(run.params).toBeUndefined();
   });
 
+  it("gives Gradle BootRun a dynamic JDWP port when debugging", () => {
+    expect(BOOT_SCRIPT).toContain("openidea.run.debug");
+    expect(BOOT_SCRIPT).toContain("address=127.0.0.1:0");
+  });
+
+  it("gives Gradle test workers a dynamic JDWP port when debugging", () => {
+    expect(TESTS_SCRIPT).toContain("openidea.run.debug");
+    expect(TESTS_SCRIPT).toContain("address=127.0.0.1:0");
+  });
+
   it("debugs the forked JVM: the init script adds the agent", () => {
     const app = applicationConfig({ className: "a.Main" }, "app/src/main/java/a/Main.java", []);
     const run = delegatedGradleConfig(app, "app", ctx)!;
@@ -142,6 +160,86 @@ describe("Build and run using: Gradle", () => {
     expect(debug.args.at(-1)).toBe(DELEGATED_DEBUG);
     expect(debug.args).not.toContain("--debug-jvm");
     expect(jdwpLaunch(debug)!.args.filter((a) => a === DELEGATED_DEBUG)).toHaveLength(1);
+    expect(jdwpLaunch(debug)!.args.filter((a) => a === DELEGATED_ATTACH_LISTENER)).toHaveLength(1);
+  });
+
+  it("asks the init script for the attach listener except when Gradle runs on Windows", () => {
+    const app = applicationConfig({ className: "a.Main" }, "app/src/main/java/a/Main.java", []);
+    const run = delegatedGradleConfig(app, "app", ctx)!;
+    expect(jdwpLaunch(run)!.args).toContain(DELEGATED_ATTACH_LISTENER);
+    const os = usePlatform.getState().os;
+    usePlatform.setState({ os: "windows" });
+    try {
+      const debug = jdwpLaunch(run)!;
+      expect(debug.args).not.toContain(DELEGATED_ATTACH_LISTENER);
+      expect(debug.args.at(-1)).toBe(DELEGATED_DEBUG);
+    } finally {
+      usePlatform.setState({ os });
+    }
+  });
+
+  it("adds the attach listener before the agent in the init script, unless the VM options decide", () => {
+    const flag = RUN_SCRIPT.indexOf("'-XX:+StartAttachListener'");
+    const agent = RUN_SCRIPT.indexOf("'-agentlib:jdwp=");
+    expect(flag).toBeGreaterThan(0);
+    expect(flag).toBeLessThan(agent);
+    const guard = RUN_SCRIPT.slice(RUN_SCRIPT.lastIndexOf("if (", flag), flag);
+    // Only when the IDE asked for it (never on Windows).
+    expect(guard).toContain("Boolean.getBoolean('openidea.run.attachListener')");
+    // The guard reads the same list the user's VM options arrive in.
+    expect(guard).toContain("list('openidea.run.jvmArgs')");
+    expect(guard).toContain("StartAttachListener|DisableAttachMechanism");
+  });
+
+  // Gradle 4.6 is the oldest IDEA supports: `register`, `named` and `configureEach` are 4.9+,
+  // `debugOptions` 5.6+, `JavaExec.mainClass` 6.4+. Each use needs a guard on its line (#3864).
+  it.each([
+    ["gradleRun", RUN_SCRIPT],
+    ["gradleTests", TESTS_SCRIPT],
+    ["gradleBoot", BOOT_SCRIPT],
+  ])("%s guards Gradle API newer than 4.6", (_, script) => {
+    const unguarded = script
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .filter((l) => /\.register\(|\.named\(|configureEach|debugOptions|mainClass/.test(l))
+      .filter((l) => !/GradleVersion|lazyTasks|hasProperty/.test(l));
+    expect(unguarded).toEqual([]);
+  });
+
+  // Up to Gradle 7.0, a build JVM with its own `org.gradle.jvmargs` gets the command line's `-D`
+  // values only once the settings load: read at an init script's top level, they are null (#4093).
+  it.each([
+    ["gradleRun", RUN_SCRIPT],
+    ["gradleTests", TESTS_SCRIPT],
+    ["gradleBoot", BOOT_SCRIPT],
+  ])("%s reads the launch's -D values in project actions, not at its top level", (_, script) => {
+    const topLevel = script
+      .split("\n")
+      .filter((l) => /^\S/.test(l) && /System\.getProperty|Boolean\.getBoolean|systemPropertiesArgs/.test(l));
+    expect(topLevel).toEqual([]);
+  });
+
+  it.each([
+    // The report: a Spring Boot application in the root project, Gradle wrapper 6.4.1.
+    ["", ":", ":openideaRun"],
+    ["app", ":app", ":app:openideaRun"],
+    [CORE, ":billing:core", ":billing:core:openideaRun"],
+  ])("runs module %j as project %s on a Gradle 6.4.1 wrapper (#4093)", (module, project, task) => {
+    const file = `${module ? `${module}/` : ""}src/main/java/com/example/demo/DemoApplication.java`;
+    const app = applicationConfig({ className: "com.example.demo.DemoApplication", spring: true }, file, []);
+    expect(wrapperGradleVersion("distributionUrl=https\\://x/gradle-6.4.1-bin.zip")).toEqual([6, 4]);
+    // Below Gradle 8.1: no configuration cache.
+    const run = delegatedGradleConfig(app, module, { ...ctx, configurationCache: false })!;
+    expect(run.args).toContain(`-Dopenidea.run.project=${project}`);
+    expect(run.args.at(-1)).toBe(task);
+    // The init script compares each project's identity path with it inside `allprojects`.
+    expect(RUN_SCRIPT).toContain("if (id() != System.getProperty('openidea.run.project')) return");
+  });
+
+  it("sets the main class with `main` and creates the task eagerly on old Gradle (#3864)", () => {
+    expect(RUN_SCRIPT).toContain("if (t.hasProperty('mainClass')) t.mainClass.set(main) else t.main = main");
+    expect(RUN_SCRIPT).toContain("else p.tasks.create('openideaRun', JavaExec, configure)");
+    expect(RUN_SCRIPT).toContain("import org.gradle.util.GradleVersion");
   });
 });
 
@@ -163,6 +261,40 @@ describe("Gradle test runs", () => {
     expect(withTestEvents(maven, script)).toBe(maven);
     const twice = withTestEvents({ kind: "gradle", command: "gradle", args: ["test"] }, script);
     expect(withTestEvents(twice, script)).toBe(twice);
+  });
+});
+
+describe("Gradle launch routing", () => {
+  const boot = {
+    kind: "gradle",
+    command: "./gradlew",
+    args: [":module:bootRun"],
+  } as RunConfig;
+  const test = { ...boot, args: [":module:test"], isTest: true };
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("leaves non-desktop launches alone", async () => {
+    vi.spyOn(ipc, "isTauri").mockReturnValue(false);
+    expect(await gradleBootLaunch(boot)).toBe(boot);
+    expect(await gradleTestLaunch(test)).toBe(test);
+  });
+
+  it("keeps the configuration when the host cannot write the init script", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(ipc.commands, "runGradleInitScript").mockRejectedValue(new Error("host unavailable"));
+    expect(await gradleBootLaunch(boot)).toBe(boot);
+    expect(await gradleTestLaunch(test)).toBe(test);
+  });
+
+  it("adds reporting scripts without enabling JDWP for plain Run", async () => {
+    for (const config of [await gradleBootLaunch(boot), await gradleTestLaunch(test)]) {
+      expect(config.args.slice(0, 2)).toEqual(["--init-script", "/tmp/openidea-gradle-run.gradle"]);
+      expect(config.args).not.toContain(DELEGATED_DEBUG);
+      expect(config.args).not.toContain("--debug-jvm");
+    }
+    expect(boot.args).toEqual([":module:bootRun"]);
+    expect(test.args).toEqual([":module:test"]);
   });
 });
 
@@ -215,4 +347,16 @@ describe("delegation across independent builds", () => {
     expect(run).toMatchObject({ command: `${ROOT}/b/gradlew`, cwd: "b" });
     expect(run!.args.at(-1)).toBe(":app:openideaRun");
   });
+});
+
+it("uses the same Rebuild preparation for delegated Run and Debug", () => {
+  const app = {
+    ...applicationConfig({ className: "a.Main" }, "app/src/main/java/a/Main.java", []),
+    buildPolicy: "rebuild" as const,
+  };
+  const run = delegatedGradleConfig(app, "app", ctx)!;
+  expect(run.args[0]).toBe("clean");
+  const debug = jdwpLaunch(run)!;
+  expect(debug.args.filter((a) => a === "clean")).toHaveLength(1);
+  expect(debug.args).toContain(DELEGATED_DEBUG);
 });

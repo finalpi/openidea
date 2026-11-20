@@ -81,13 +81,20 @@ fn css_regions<'t>(grammar: &str, tree: &Tree, text: &'t str) -> Vec<(usize, &'t
 }
 
 /// Pre-order walk; `f` returns whether to descend.
-fn walk<'t>(n: Node<'t>, f: &mut dyn FnMut(Node<'t>) -> bool) {
-    if !f(n) {
-        return;
-    }
-    let mut c = n.walk();
-    for child in n.children(&mut c) {
-        walk(child, f);
+pub(crate) fn walk<'t>(n: Node<'t>, f: &mut dyn FnMut(Node<'t>) -> bool) {
+    let mut cursor = n.walk();
+    loop {
+        if f(cursor.node()) && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
 }
 
@@ -122,7 +129,7 @@ pub(crate) fn definitions(g: &Grammar, css: Option<&Grammar>, tree: &Tree, text:
             };
             if let Some((name, kind)) = def {
                 let range = idx.range(base + n.start_byte(), base + n.end_byte());
-                out.push(SymbolTag { name, kind, container: None, range });
+                out.push(SymbolTag { name, kind, container: None, range, bases: Vec::new() });
             }
             true
         });

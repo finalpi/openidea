@@ -5,6 +5,7 @@ import {
   commands,
   IpcError,
   isCancelled,
+  isErrorKind,
   isTauri,
   type RecentProject,
   type RecentProjectGroup,
@@ -24,6 +25,7 @@ import {
 import { tx } from "@/platform/i18n";
 import { fuzzyMatch } from "@/ui";
 import { notifications } from "@/workbench/contributions";
+import { confirm } from "@/workbench/messages";
 import { openRemoteProject } from "@/workbench/projectWindow";
 
 interface RecentState {
@@ -115,6 +117,14 @@ export async function removeRecent(path: string) {
     notifications().notify({ level: "error", title: "Cannot remove recent project", body: r.error.message });
 }
 
+/** An open failure's kind and message, whether it is an `IpcError` or a raw rejected invoke. */
+function failure(e: unknown): { kind?: unknown; message: string } {
+  if (e instanceof IpcError) return { kind: e.kind, message: e.message };
+  if (e && typeof e === "object" && "message" in e)
+    return { kind: "kind" in e ? e.kind : undefined, message: String(e.message) };
+  return { message: e instanceof Error ? e.message : String(e) };
+}
+
 /** Opens a project from the recent list; offers to remove entries whose folder is gone. */
 export async function openRecent(project: Pick<RecentProject, "path" | "name">): Promise<boolean> {
   if (!isTauri()) {
@@ -140,12 +150,22 @@ export async function openRecent(project: Pick<RecentProject, "path" | "name">):
     return true;
   } catch (e) {
     if (isCancelled(e)) return false;
-    const message = e instanceof Error ? e.message : String(e);
-    const missing = e instanceof IpcError ? e.kind === "notFound" : /not found|no such/i.test(message);
+    const error = failure(e);
+    const { message } = error;
+    if (isErrorKind(error, "notFound") || (!error.kind && /not found|no such/i.test(message))) {
+      // A balloon can be switched off for this group and the welcome screen has no log to open.
+      const remove = await confirm({
+        title: tx`Project folder not found: ${project.name}`,
+        message: project.path,
+        ok: "Remove from Recent Projects",
+      });
+      if (remove) await removeRecent(project.path);
+      return false;
+    }
     notifications().notify({
       level: "error",
-      title: missing ? `Project folder not found: ${project.name}` : `Cannot open ${project.name}`,
-      body: missing ? project.path : message,
+      title: `Cannot open ${project.name}`,
+      body: message,
       key: `welcome.open:${project.path}`,
       actions: [{ label: "Remove from Recent Projects", run: () => void removeRecent(project.path) }],
     });

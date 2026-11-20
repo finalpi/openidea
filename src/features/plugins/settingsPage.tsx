@@ -6,26 +6,8 @@ import { SecretsDetails, type SecretDecl } from "./secrets";
 import { usePlugins } from "./store";
 import { itemsOf } from "./projection";
 import { diagnosticMessage, runSettingsCommand, type SettingsCommandResult } from "./settingsCommands";
+import type { SettingSchema, SettingsDecl } from "./settings";
 import styles from "./PluginsPage.module.css";
-
-export interface SettingSchema {
-  key: string;
-  type: "boolean" | "string" | "number" | "integer";
-  title: string;
-  description?: string | null;
-  default: unknown;
-  options?: string[] | null;
-  multiline?: boolean;
-  choicesCommand?: string | null;
-  choicesDependencies?: string[] | null;
-  order?: number;
-}
-
-export interface SettingsDecl {
-  title: string;
-  properties: SettingSchema[];
-  actions?: { command: string; title: string }[];
-}
 
 type PluginSettings = Record<string, Record<string, unknown>>;
 
@@ -224,7 +206,7 @@ export function settingsPage(pluginId: string, decl: SettingsDecl) {
       setError(null);
       setResult(null);
       try {
-        const next = await runSettingsCommand(pluginId, command, values);
+        const next = await runSettingsCommand(pluginId, command, values, form.scope);
         if (!alive.current || current.current !== signature) return;
         setResult(next);
         return next;

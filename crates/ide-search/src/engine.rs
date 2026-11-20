@@ -6,8 +6,8 @@ use crate::mask::FileMask;
 use crate::pattern::ScopePattern;
 use crate::query::{Compiled, line_terminator};
 use crate::{
-    FileMatches, LineMatch, LiteralKind, LiteralRange, Literals, Overlay, PathFilter, SearchContext, SearchScope,
-    SearchSummary,
+    FileMatches, LineMatch, LiteralKind, LiteralRange, Literals, PathFilter, SearchContext, SearchScope, SearchSummary,
+    TextSource,
 };
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -22,6 +22,9 @@ pub(crate) const DEFAULT_MAX_MATCHES: u32 = 10_000;
 /// How many matched lines a sink handles between cancellation-token checks
 /// (reads from disk check on every buffer refill).
 const CANCEL_CHECK_LINES: u32 = 256;
+/// How many matches a file keeps before claiming them from the shared budget: each file
+/// searched in parallel holds about this many unclaimed matches at most, not up to the whole budget.
+const CLAIM_BATCH: u32 = 64;
 
 pub(crate) struct Request<'a> {
     pub root: &'a Path,
@@ -33,7 +36,9 @@ pub(crate) struct Request<'a> {
     pub context: SearchContext,
     pub literals: Option<Literals<'a>>,
     pub max_matches: u32,
-    pub overlay: Overlay<'a>,
+    /// Skip what `.gitignore` / `.ignore` / `info/exclude` leave out.
+    pub ignore_rules: bool,
+    pub text: TextSource<'a>,
     pub cancel: &'a CancellationToken,
     pub on_file: &'a (dyn Fn(FileMatches) + Sync),
 }
@@ -87,6 +92,11 @@ impl Control<'_> {
             }
         }
     }
+
+    /// Returns matches claimed for a file whose matches are then dropped.
+    fn release(&self, n: u32) {
+        self.matches.fetch_sub(n, Relaxed);
+    }
 }
 
 struct Ctx<'a> {
@@ -96,7 +106,7 @@ struct Ctx<'a> {
     filter: Option<PathFilter<'a>>,
     context: SearchContext,
     literals: Option<Literals<'a>>,
-    overlay: Overlay<'a>,
+    text: TextSource<'a>,
     on_file: &'a (dyn Fn(FileMatches) + Sync),
     ctl: Control<'a>,
 }
@@ -111,7 +121,7 @@ pub(crate) fn run(req: Request<'_>) -> IdeResult<SearchSummary> {
         filter: req.filter,
         context: req.context,
         literals: if req.context == SearchContext::Any { None } else { req.literals },
-        overlay: req.overlay,
+        text: req.text,
         on_file: req.on_file,
         ctl: Control {
             cancel: req.cancel,
@@ -143,18 +153,23 @@ pub(crate) fn run(req: Request<'_>) -> IdeResult<SearchSummary> {
     }
 
     if !ctx.ctl.should_stop() {
-        walk_files(&on_disk, || {
-            let mut searcher = searcher_builder.build();
-            let matcher = matcher.clone();
-            let ctx = &ctx;
-            Box::new(move |path| {
-                if ctx.ctl.should_stop() {
-                    return WalkState::Quit;
-                }
-                ctx.search_file(path, &matcher, &mut searcher);
-                if ctx.ctl.stopped() { WalkState::Quit } else { WalkState::Continue }
-            })
-        });
+        walk_files(
+            &on_disk,
+            req.ignore_rules,
+            &|path| ctx.mask.has_directory_exclusions() && ctx.mask.excludes_dir(&rel_path(ctx.root, path)),
+            || {
+                let mut searcher = searcher_builder.build();
+                let matcher = matcher.clone();
+                let ctx = &ctx;
+                Box::new(move |path| {
+                    if ctx.ctl.should_stop() {
+                        return WalkState::Quit;
+                    }
+                    ctx.search_file(path, &matcher, &mut searcher);
+                    if ctx.ctl.stopped() { WalkState::Quit } else { WalkState::Continue }
+                })
+            },
+        );
     }
 
     let cancelled = ctx.ctl.cancelled.load(Relaxed) || req.cancel.is_cancelled();
@@ -175,19 +190,25 @@ pub(crate) type VisitFile<'s> = Box<dyn FnMut(&Path) -> WalkState + Send + 's>;
 /// `.gitignore` / `.ignore` / `info/exclude` are skipped with everything in
 /// them, while ignored files elsewhere (`.env`) and hidden files and folders
 /// (`.github`, `.eslintrc`) are visited. `.git`, symlinks and archives (jar,
-/// zip: browsed, not searched) are never visited.
-pub(crate) fn walk_files<'s>(roots: &[PathBuf], mut visitor: impl FnMut() -> VisitFile<'s> + Send) {
+/// zip: browsed, not searched) are never visited. Without `ignore_rules` the
+/// ignored directories are visited too.
+pub(crate) fn walk_files<'s>(
+    roots: &[PathBuf],
+    ignore_rules: bool,
+    skip_dir: &'s (dyn Fn(&Path) -> bool + Sync),
+    mut visitor: impl FnMut() -> VisitFile<'s> + Send,
+) {
     let Some((first, rest)) = roots.split_first() else { return };
     let mut walk = WalkBuilder::new(first);
     for path in rest {
         walk.add(path);
     }
     walk.hidden(false)
-        .ignore(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
+        .ignore(ignore_rules)
+        .git_ignore(ignore_rules)
+        .git_global(ignore_rules)
+        .git_exclude(ignore_rules)
+        .parents(ignore_rules)
         .require_git(ide_core::ignored::inside_git_repo(first))
         .follow_links(false)
         .threads(std::thread::available_parallelism().map_or(4, |n| n.get()).min(12))
@@ -204,6 +225,9 @@ pub(crate) fn walk_files<'s>(roots: &[PathBuf], mut visitor: impl FnMut() -> Vis
             };
             let Some(file_type) = entry.file_type() else { return WalkState::Continue };
             if file_type.is_dir() {
+                if skip_dir(entry.path()) {
+                    return WalkState::Skip;
+                }
                 // The walker drops ignored files unseen, so the files of every walked
                 // directory come from listing it; the walker only picks the directories.
                 let Ok(children) = std::fs::read_dir(entry.path()) else { return WalkState::Continue };
@@ -280,11 +304,17 @@ impl Ctx<'_> {
         // The search context needs the whole text to find comments and string literals.
         let in_context = match self.literals {
             Some(literals) => {
-                let text = match (self.overlay)(path) {
+                let text = match (self.text.overlay)(path) {
                     Some(text) => text,
-                    // Unreadable or not UTF-8 (binary): nothing to classify.
-                    None => match std::fs::read_to_string(path) {
-                        Ok(text) => text,
+                    None => match std::fs::read(path) {
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(text) => text,
+                            // Binary content has nothing to classify.
+                            Err(e) => match (self.text.decode)(path, e.as_bytes()) {
+                                Some(text) => text,
+                                None => return,
+                            },
+                        },
                         Err(_) => return,
                     },
                 };
@@ -296,50 +326,61 @@ impl Ctx<'_> {
             }
             None => None,
         };
-        let mut sink = FileSink {
-            matcher,
-            ctl: &self.ctl,
-            lines: Vec::new(),
-            count: 0,
-            binary: false,
-            ticks: 0,
-            found: Vec::new(),
-            ranges: Vec::new(),
-            context: in_context.as_ref().map(|(_, ranges)| (self.context, ranges.as_slice())),
-        };
+        let context = in_context.as_ref().map(|(_, ranges)| (self.context, ranges.as_slice()));
+        let mut sink = FileSink::new(matcher, &self.ctl, context);
         let result = match &in_context {
             Some((text, _)) => searcher.search_slice(matcher, text.as_bytes(), &mut sink),
-            None => match (self.overlay)(path) {
+            None => match (self.text.overlay)(path) {
                 Some(text) => searcher.search_slice(matcher, text.as_bytes(), &mut sink),
-                None => match std::fs::File::open(path) {
-                    Ok(file) => searcher.search_reader(matcher, StopReader { inner: file, ctl: &self.ctl }, &mut sink),
-                    Err(err) => Err(err),
-                },
+                None => self.search_disk(path, matcher, searcher, &mut sink),
             },
         };
-        if let Err(err) = result {
-            if !self.ctl.stopped() {
-                tracing::debug!("search {}: {err}", path.display());
-            }
-            if sink.lines.is_empty() || self.ctl.cancelled.load(Relaxed) {
-                return;
-            }
+        if let Err(err) = result
+            && !self.ctl.stopped()
+        {
+            tracing::debug!("search {}: {err}", path.display());
         }
         if sink.binary || sink.lines.is_empty() || self.ctl.cancelled.load(Relaxed) {
+            self.ctl.release(sink.claimed);
             return;
         }
-        let found = u32::try_from(sink.count).unwrap_or(u32::MAX);
-        let granted = self.ctl.reserve(found);
-        if granted < found {
-            self.ctl.limit_hit.store(true, Relaxed);
-            self.ctl.stop.store(true, Relaxed);
-            truncate(&mut sink.lines, granted as usize);
-        }
+        sink.settle();
         if sink.lines.is_empty() {
             return;
         }
         self.ctl.files.fetch_add(1, Relaxed);
         (self.on_file)(FileMatches { path: path.into(), rel_path: rel, matches: sink.lines });
+    }
+
+    /// Streams the file's bytes; a file that turns out not to be UTF-8 (GBK,
+    /// UTF-16 …) is searched again in the text `decode` gives it.
+    fn search_disk<'s>(
+        &'s self,
+        path: &Path,
+        matcher: &'s RegexMatcher,
+        searcher: &mut Searcher,
+        sink: &mut FileSink<'s>,
+    ) -> io::Result<()> {
+        let mut reader = Utf8Probe::new(StopReader { inner: std::fs::File::open(path)?, ctl: &self.ctl });
+        let result = searcher.search_reader(matcher, &mut reader, &mut *sink);
+        // NUL bytes in the head of UTF-16 text stop the byte search; later ones mark binary.
+        let decode = if sink.binary {
+            reader.head.contains(&0) && !ide_vfs::looks_binary(&reader.head)
+        } else {
+            !reader.is_utf8()
+        };
+        // A stopped search needs the decoded text only to fill what the byte search claimed.
+        if !decode || (self.ctl.stopped() && sink.claimed == 0) {
+            return result;
+        }
+        let Some(text) = (self.text.decode)(path, &std::fs::read(path)?) else {
+            sink.binary = true;
+            return Ok(());
+        };
+        let claimed = sink.claimed;
+        *sink = FileSink::new(matcher, &self.ctl, None);
+        sink.claimed = claimed;
+        searcher.search_slice(matcher, text.as_bytes(), sink)
     }
 }
 
@@ -356,8 +397,11 @@ struct FileSink<'a> {
     matcher: &'a RegexMatcher,
     ctl: &'a Control<'a>,
     lines: Vec<LineMatch>,
-    /// Match ranges collected so far.
-    count: usize,
+    /// Match ranges kept so far.
+    count: u32,
+    /// Matches claimed from the shared budget: up to `count`, or more while a decoded
+    /// file is searched again under the claim of its byte search.
+    claimed: u32,
     binary: bool,
     ticks: u32,
     /// Scratch buffers reused across lines.
@@ -365,6 +409,57 @@ struct FileSink<'a> {
     ranges: Vec<(usize, usize)>,
     /// Search context filter and the file's comments / string literals.
     context: Option<(SearchContext, &'a [LiteralRange])>,
+}
+
+impl<'a> FileSink<'a> {
+    fn new(
+        matcher: &'a RegexMatcher,
+        ctl: &'a Control<'a>,
+        context: Option<(SearchContext, &'a [LiteralRange])>,
+    ) -> Self {
+        Self {
+            matcher,
+            ctl,
+            lines: Vec::new(),
+            count: 0,
+            claimed: 0,
+            binary: false,
+            ticks: 0,
+            found: Vec::new(),
+            ranges: Vec::new(),
+            context,
+        }
+    }
+
+    /// Claims the matches kept since the last claim. When the budget cannot take them
+    /// all, keeps the ones it can, marks the limit hit and returns false.
+    fn claim(&mut self) -> bool {
+        if self.count <= self.claimed {
+            return true;
+        }
+        let unclaimed = self.count - self.claimed;
+        let granted = self.ctl.reserve(unclaimed);
+        self.claimed += granted;
+        if granted == unclaimed {
+            return true;
+        }
+        self.ctl.limit_hit.store(true, Relaxed);
+        self.ctl.stop.store(true, Relaxed);
+        truncate(&mut self.lines, self.claimed as usize);
+        self.count = self.claimed;
+        false
+    }
+
+    /// Makes the claim match the matches kept once the file is done: claims the rest, or
+    /// gives back the part of a byte search's claim the decoded text did not use.
+    fn settle(&mut self) {
+        if self.count < self.claimed {
+            self.ctl.release(self.claimed - self.count);
+            self.claimed = self.count;
+        } else {
+            self.claim();
+        }
+    }
 }
 
 /// Kind of the comment or string literal containing byte `pos` (`literals` sorted).
@@ -378,7 +473,9 @@ impl Sink for FileSink<'_> {
 
     fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> Result<bool, io::Error> {
         self.ticks += 1;
-        if self.ctl.stopped() || (self.ticks.is_multiple_of(CANCEL_CHECK_LINES) && self.ctl.should_stop()) {
+        let stop = self.ctl.stopped() || (self.ticks.is_multiple_of(CANCEL_CHECK_LINES) && self.ctl.should_stop());
+        // Unless cancelled, a decoded file still fills the claim its byte search took.
+        if stop && (self.count >= self.claimed || self.ctl.cancelled.load(Relaxed)) {
             return Ok(false);
         }
         let buffer = m.buffer();
@@ -422,7 +519,7 @@ impl Sink for FileSink<'_> {
                 ranges.push((a - line_start, b - line_start));
             }
             if !ranges.is_empty() {
-                self.count += ranges.len();
+                self.count = self.count.saturating_add(u32::try_from(ranges.len()).unwrap_or(u32::MAX));
                 let line_no = u32::try_from(line_no).unwrap_or(u32::MAX);
                 self.lines.push(line_match(line_no, &block[line_start..content_end], &ranges));
             }
@@ -432,7 +529,8 @@ impl Sink for FileSink<'_> {
         self.found = found;
         self.ranges = ranges;
         // One match beyond the remaining budget is enough to know the limit is hit.
-        Ok(self.count <= self.ctl.remaining() as usize)
+        let unclaimed = self.count.saturating_sub(self.claimed);
+        Ok(if unclaimed >= CLAIM_BATCH || unclaimed > self.ctl.remaining() { self.claim() } else { true })
     }
 
     fn binary_data(&mut self, _searcher: &Searcher, _offset: u64) -> Result<bool, io::Error> {
@@ -453,5 +551,193 @@ impl<R: Read> Read for StopReader<'_, R> {
             return Err(io::Error::other("search stopped"));
         }
         self.inner.read(buf)
+    }
+}
+
+/// How many leading bytes [`Utf8Probe`] keeps for the binary check.
+const HEAD_LEN: usize = 8 * 1024;
+
+/// Passes bytes through while checking that they are UTF-8, keeping the head
+/// of the file.
+struct Utf8Probe<R> {
+    inner: R,
+    head: Vec<u8>,
+    /// Bytes of a character split across reads.
+    partial: Vec<u8>,
+    invalid: bool,
+}
+
+impl<R> Utf8Probe<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, head: Vec::new(), partial: Vec::new(), invalid: false }
+    }
+
+    /// Whether everything read so far was UTF-8 (a truncated final character
+    /// is not).
+    fn is_utf8(&self) -> bool {
+        !self.invalid && self.partial.is_empty()
+    }
+
+    fn check(&mut self, mut bytes: &[u8]) {
+        if self.invalid {
+            return;
+        }
+        if let Some(&lead) = self.partial.first() {
+            let width = utf8_width(lead);
+            let take = (width - self.partial.len()).min(bytes.len());
+            self.partial.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.partial.len() < width {
+                return;
+            }
+            if std::str::from_utf8(&self.partial).is_err() {
+                self.invalid = true;
+                return;
+            }
+            self.partial.clear();
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(_) => {}
+            Err(e) if e.error_len().is_none() => self.partial.extend_from_slice(&bytes[e.valid_up_to()..]),
+            Err(_) => self.invalid = true,
+        }
+    }
+}
+
+/// Encoded length of a UTF-8 sequence starting with `lead` (a valid lead byte
+/// of an incomplete sequence).
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0xF0.. => 4,
+        0xE0.. => 3,
+        _ => 2,
+    }
+}
+
+impl<R: Read> Read for Utf8Probe<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let read = &buf[..n];
+        if self.head.len() < HEAD_LEN {
+            let take = (HEAD_LEN - self.head.len()).min(n);
+            self.head.extend_from_slice(&read[..take]);
+        }
+        self.check(read);
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Utf8Probe;
+    use std::io::Read;
+
+    /// Reads `bytes` through a probe in chunks of `chunk` bytes.
+    fn probe(bytes: &[u8], chunk: usize) -> bool {
+        let mut probe = Utf8Probe::new(bytes);
+        let mut buf = vec![0; chunk];
+        while probe.read(&mut buf).unwrap() > 0 {}
+        probe.is_utf8()
+    }
+
+    #[test]
+    fn checks_utf8_across_read_boundaries() {
+        let utf8 = "a中文😀b".as_bytes();
+        let (gbk, _, _) = encoding_rs::GBK.encode("a中文b");
+        for chunk in 1..=utf8.len() {
+            assert!(probe(utf8, chunk), "chunk {chunk}");
+            assert!(!probe(&gbk, chunk), "chunk {chunk}");
+            assert!(!probe(&utf8[..utf8.len() - 2], chunk), "truncated, chunk {chunk}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn excluded_subtree_is_not_visited() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("edge/device/build/deep")).unwrap();
+        std::fs::create_dir_all(root.join("edge/device/src")).unwrap();
+        std::fs::write(root.join("edge/device/build/deep/generated.go"), "hit").unwrap();
+        std::fs::write(root.join("edge/device/src/main.go"), "hit").unwrap();
+        let mask = FileMask::new(&[], &["**/build/**".into()]).unwrap();
+        let seen = Mutex::new(Vec::new());
+        walk_files(&[root.to_path_buf()], true, &|path| mask.excludes_dir(&rel_path(root, path)), || {
+            let seen = &seen;
+            Box::new(move |path| {
+                // No file-level mask here: a visit means the walker entered the subtree.
+                seen.lock().unwrap().push(rel_path(root, path));
+                WalkState::Continue
+            })
+        });
+        assert_eq!(*seen.lock().unwrap(), ["edge/device/src/main.go"]);
+        seen.lock().unwrap().clear();
+        walk_files(
+            &[root.join("edge/device/build/deep")],
+            true,
+            &|path| mask.excludes_dir(&rel_path(root, path)),
+            || {
+                let seen = &seen;
+                Box::new(move |path| {
+                    seen.lock().unwrap().push(rel_path(root, path));
+                    WalkState::Continue
+                })
+            },
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn control(cancel: &CancellationToken, max: u32) -> Control<'_> {
+        Control {
+            cancel,
+            stop: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            limit_hit: AtomicBool::new(false),
+            matches: AtomicU32::new(0),
+            files: AtomicU32::new(0),
+            max,
+        }
+    }
+
+    /// Searches `lines` matching lines without finishing the file, like a walker thread mid-file.
+    fn scan<'a>(ctl: &'a Control<'a>, matcher: &'a RegexMatcher, lines: usize) -> FileSink<'a> {
+        let mut sink = FileSink::new(matcher, ctl, None);
+        let mut searcher = SearcherBuilder::new().line_number(true).build();
+        searcher.search_slice(matcher, "x\n".repeat(lines).as_bytes(), &mut sink).unwrap();
+        sink
+    }
+
+    #[test]
+    fn files_in_flight_never_hold_more_matches_than_the_budget() {
+        let cancel = CancellationToken::new();
+        let ctl = control(&cancel, 100);
+        let matcher = RegexMatcher::new("x").unwrap();
+        let (first, second) = (scan(&ctl, &matcher, 150), scan(&ctl, &matcher, 150));
+        assert_eq!((first.lines.len(), second.lines.len()), (100, 0));
+        assert_eq!(ctl.matches.load(Relaxed), 100);
+        assert!(ctl.limit_hit.load(Relaxed));
+    }
+
+    #[test]
+    fn unclaimed_matches_of_a_file_in_flight_stay_within_the_budget() {
+        let cancel = CancellationToken::new();
+        let ctl = control(&cancel, 1000);
+        let matcher = RegexMatcher::new("x").unwrap();
+        let mut first = scan(&ctl, &matcher, 40);
+        let second = scan(&ctl, &matcher, 2000);
+        assert_eq!((first.lines.len(), second.lines.len()), (40, 1000));
+        assert!(!first.claim());
+        assert_eq!((first.lines.len(), ctl.matches.load(Relaxed)), (0, 1000));
+        assert!(ctl.limit_hit.load(Relaxed));
     }
 }

@@ -7,6 +7,7 @@ import {
   importExternal,
   paste,
   refreshOsClipboard,
+  revealablePath,
   selectionAfterDelete,
   transfer,
   topLevelPaths,
@@ -182,6 +183,26 @@ describe("OS file imports", () => {
       expect.objectContaining({ title: "Some items could not be copied", body: "missing.txt: SSH disconnected" }),
     );
     expect(fs.nodes.has("/p/target/local.txt")).toBe(true);
+  });
+
+  it("saves a pasted image as img.png, then img_1.png, and selects it", async () => {
+    const png = new Uint8Array([137, 80, 78, 71]);
+    setOsClipboardForTests({ hasImage: async () => true, image: async () => png });
+    await refreshOsClipboard();
+    expect(canPaste()).toBe(true);
+    await paste("/p/target");
+    await paste("/p/target");
+    expect(fs.nodes.get("/p/target/img.png")).toEqual({ kind: "file", size: 4 });
+    expect(fs.nodes.has("/p/target/img_1.png")).toBe(true);
+    expect(useProjectTree.getState().revealRequest?.path).toBe("/p/target/img_1.png");
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("says the clipboard is empty when it holds neither files nor an image", async () => {
+    setOsClipboardForTests({});
+    await paste("/p/target");
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ title: "No files on the clipboard" }));
+    expect([...fs.nodes.keys()].filter((p) => p.startsWith("/p/target/"))).toEqual([]);
   });
 
   it("reports a clipboard read failure", async () => {
@@ -450,5 +471,45 @@ describe("project clipboard ownership", () => {
     await refreshing;
     expect(useProjectTree.getState().clipboard).toBe(newer);
     expect(canPaste()).toBe(true);
+  });
+});
+
+describe("revealablePath", () => {
+  const platform = usePlatform.getState();
+  afterEach(() => {
+    usePlatform.setState(platform);
+    useRemote.setState({ session: null });
+  });
+
+  it("translates distro paths to the \\\\wsl.localhost share for a WSL session on Windows", () => {
+    usePlatform.setState({ os: "windows" });
+    useRemote.setState({
+      session: {
+        target: { kind: "wsl", distro: "Ubuntu-24.04" },
+        root: "/p",
+        host: "Ubuntu",
+        os: "linux",
+        commands: [],
+      },
+    });
+    expect(revealablePath("/home/me/app/src/main.rs")).toBe(
+      "\\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\app\\src\\main.rs",
+    );
+    expect(revealablePath("/")).toBe("\\\\wsl.localhost\\Ubuntu-24.04\\");
+  });
+
+  it("leaves paths alone for local projects, SSH sessions and non-Windows desktops", () => {
+    usePlatform.setState({ os: "windows" });
+    useRemote.setState({
+      session: { target: { kind: "ssh", config: "host" }, root: "/p", host: "host", os: "linux", commands: [] },
+    });
+    expect(revealablePath("/home/me/app")).toBe("/home/me/app");
+    useRemote.setState({ session: null });
+    expect(revealablePath("C:\\work\\app")).toBe("C:\\work\\app");
+    usePlatform.setState({ os: "macos" });
+    useRemote.setState({
+      session: { target: { kind: "wsl", distro: "Ubuntu" }, root: "/p", host: "Ubuntu", os: "linux", commands: [] },
+    });
+    expect(revealablePath("/home/me/app")).toBe("/home/me/app");
   });
 });

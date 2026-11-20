@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { AgentProvider, AgentRegistry, InstallEvent, RegistryAgent, RequestId } from "@/bindings";
+import type {
+  AcpImportOutcome,
+  AgentProvider,
+  AgentRegistry,
+  InstallEvent,
+  RegistryAgent,
+  RequestId,
+} from "@/bindings";
 import { IpcError } from "@/platform/ipc";
 import { setLocale, tx } from "@/platform/i18n";
 import { iconMarkup } from "@/ui/icons";
@@ -23,6 +30,7 @@ function AgentRegistryPage(props: ComponentProps<typeof RegistryPage>) {
 }
 import { ADD_AGENT, providerOptions } from "./providerOptions";
 import {
+  afterInstall,
   afterRemove,
   matchesQuery,
   rowActions,
@@ -80,19 +88,30 @@ class FakeBackend implements RegistryBackend {
     this.installRequests.push(request);
     this.emit = onEvent;
     return new Promise<void>((resolve, reject) => {
-      this.finish = resolve;
+      this.finish = () => {
+        this.registry = { ...this.registry, agents: afterInstall(this.registry.agents, id) };
+        resolve();
+      };
       this.fail = reject;
     });
   }
   async remove(id: string) {
     this.removed.push(id);
+    this.registry = { ...this.registry, agents: afterRemove(this.registry.agents, id) };
   }
   cancel(request: RequestId) {
     this.cancelled.push(request);
   }
 }
 
-const row = (name: string) => screen.getByRole("listitem", { name });
+/** The registry agent's details, selecting it in the list first. */
+const row = (name: string) => {
+  const shown = screen.queryByRole("region", { name });
+  if (shown) return shown;
+  fireEvent.mouseDown(screen.getByRole("option", { name: new RegExp(`^${name}`) }));
+  return screen.getByRole("region", { name });
+};
+const item = (name: string) => screen.getByRole("option", { name: new RegExp(`^${name}`) });
 
 describe("registry helpers", () => {
   it("matches every word of the query against name, id, description and authors", () => {
@@ -176,17 +195,35 @@ describe("agent picker", () => {
   });
 });
 
-describe("Agents settings page", () => {
-  const renderRegistry = (...args: Parameters<typeof render>) => {
-    const result = render(...args);
-    fireEvent.click(screen.getByRole("tab", { name: "ACP Registry" }));
-    return result;
+describe("the ACP Registry in the agent list", () => {
+  /** The page, with the registry's installed agents as the machine's agents. */
+  const renderRegistry = (backend: FakeBackend, onChanged?: () => void) => {
+    const commands = new FakeCommands();
+    commands.providers.mockImplementation(async () =>
+      backend.registry.agents
+        .filter((a) => a.installed != null)
+        .map((a) => ({
+          ...claudeProvider("x"),
+          id: a.id,
+          name: a.name,
+          loginHint: null,
+          commandEditable: false,
+          commandReadOnlyReason: "registry" as const,
+          source: { kind: "registry" as const, version: a.installed!, update: a.update ? a.version : null },
+        })),
+    );
+    return render(
+      <>
+        <AgentRegistryPage backend={backend} commandBackend={commands} onChanged={onChanged} />
+        <MessagesHost />
+      </>,
+    );
   };
   it("shows the built-in Copilot name and icon in its registry row", async () => {
     const backend = new FakeBackend();
     backend.registry = { agents: [agent({ id: "copilot", name: "GitHub Copilot" })], warning: null };
-    renderRegistry(<AgentRegistryPage backend={backend} />);
-    const copilot = await screen.findByRole("listitem", { name: "GitHub Copilot" });
+    renderRegistry(backend);
+    const copilot = await screen.findByRole("option", { name: "GitHub Copilot" });
     const expected = document.createElement("div");
     expected.innerHTML = iconMarkup("agent-copilot")!;
     expect(copilot.querySelector("svg")?.innerHTML).toBe(expected.querySelector("svg")?.innerHTML);
@@ -195,18 +232,20 @@ describe("Agents settings page", () => {
 
   it("lists registry agents, says they are third-party, and searches them", async () => {
     const backend = new FakeBackend();
-    renderRegistry(<AgentRegistryPage backend={backend} />);
+    renderRegistry(backend);
     await waitFor(() => expect(row("Amp")).toBeInTheDocument());
     expect(screen.getByText(/third-party software/)).toBeInTheDocument();
     expect(within(row("Amp")).getByRole("button", { name: "Install" })).toBeEnabled();
     expect(within(row("Amp")).getByRole("button", { name: "Repository" })).toBeInTheDocument();
-    expect(within(row("Cline")).getByText("3.0.74 available")).toBeInTheDocument();
+    expect(within(item("Cline")).getByText("Update")).toBeInTheDocument();
+    expect(within(row("Cline")).getByText("ACP Registry · 3.0.70")).toBeInTheDocument();
+    expect(within(row("Cline")).getByText("3.0.74 is available")).toBeInTheDocument();
     expect(within(row("Cline")).getByRole("button", { name: "Update" })).toBeInTheDocument();
     expect(within(row("fast-agent")).getByRole("button", { name: "Remove" })).toBeInTheDocument();
     expect(within(row("fast-agent")).queryByRole("button", { name: "Update" })).toBeNull();
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search agents" }), { target: { value: "frontier" } });
-    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getAllByRole("option")).toHaveLength(1);
     fireEvent.change(screen.getByRole("textbox", { name: "Search agents" }), { target: { value: "nothing" } });
     expect(screen.getByText("No agents match")).toBeInTheDocument();
   });
@@ -214,7 +253,7 @@ describe("Agents settings page", () => {
   it("installs with progress, then reports the change", async () => {
     const backend = new FakeBackend();
     const onChanged = vi.fn();
-    renderRegistry(<AgentRegistryPage onChanged={onChanged} backend={backend} />);
+    renderRegistry(backend, onChanged);
     await waitFor(() => expect(row("Amp")).toBeInTheDocument());
     fireEvent.click(within(row("Amp")).getByRole("button", { name: "Install" }));
     expect(backend.installs).toEqual(["amp-acp"]);
@@ -226,21 +265,16 @@ describe("Agents settings page", () => {
 
     await act(async () => backend.finish());
     expect(onChanged).toHaveBeenCalledTimes(1);
-    expect(within(row("Amp")).getByText("Installed")).toBeInTheDocument();
-    expect(within(row("Amp")).getByRole("button", { name: "Remove" })).toBeEnabled();
+    await waitFor(() => expect(within(row("Amp")).getByRole("button", { name: "Remove" })).toBeEnabled());
+    expect(within(row("Amp")).getByText("ACP Registry · 0.10.0")).toBeInTheDocument();
   });
 
   it("asks before installing an agent whose download has no checksum", async () => {
     const backend = new FakeBackend();
     backend.registry = { agents: [{ ...AMP, noChecksum: true }], warning: null };
-    renderRegistry(
-      <>
-        <AgentRegistryPage backend={backend} />
-        <MessagesHost />
-      </>,
-    );
+    renderRegistry(backend);
     await waitFor(() => expect(row("Amp")).toBeInTheDocument());
-    expect(within(row("Amp")).getByText("No checksum provided")).toBeInTheDocument();
+    expect(within(row("Amp")).getByText(/No checksum provided/)).toBeInTheDocument();
 
     fireEvent.click(within(row("Amp")).getByRole("button", { name: "Install" }));
     let dialog = await screen.findByRole("dialog");
@@ -257,12 +291,7 @@ describe("Agents settings page", () => {
 
   it("installs an agent with a checksum without asking", async () => {
     const backend = new FakeBackend();
-    renderRegistry(
-      <>
-        <AgentRegistryPage backend={backend} />
-        <MessagesHost />
-      </>,
-    );
+    renderRegistry(backend);
     await waitFor(() => expect(row("Amp")).toBeInTheDocument());
     expect(screen.queryByText("No checksum provided")).toBeNull();
     fireEvent.click(within(row("Amp")).getByRole("button", { name: "Install" }));
@@ -272,7 +301,7 @@ describe("Agents settings page", () => {
 
   it("shows why an install failed, cancels one on Cancel, and leaves it running when the page closes", async () => {
     const backend = new FakeBackend();
-    const { unmount } = renderRegistry(<AgentRegistryPage backend={backend} />);
+    const { unmount } = renderRegistry(backend);
     await waitFor(() => expect(row("Cline")).toBeInTheDocument());
     fireEvent.click(within(row("Cline")).getByRole("button", { name: "Update" }));
     await act(async () => backend.fail(new IpcError({ kind: "unavailable", message: "npm is required" })));
@@ -296,7 +325,7 @@ describe("Agents settings page", () => {
     const backend = new FakeBackend();
     const onChanged = vi.fn();
     backend.registry = { agents: [{ ...AMP, installing: true }, CLINE], warning: null };
-    renderRegistry(<AgentRegistryPage onChanged={onChanged} backend={backend} />);
+    renderRegistry(backend, onChanged);
     await waitFor(() => expect(row("Amp")).toBeInTheDocument());
     expect(within(row("Amp")).getByText("Installing Amp in the background…")).toBeInTheDocument();
     // It is stopped from the background tasks, and nothing else starts meanwhile.
@@ -306,7 +335,9 @@ describe("Agents settings page", () => {
     expect(within(row("Cline")).getByRole("button", { name: "Update" })).toBeDisabled();
 
     backend.registry = { agents: [{ ...AMP, installed: AMP.version }, CLINE], warning: null };
-    await waitFor(() => expect(within(row("Amp")).getByText("Installed")).toBeInTheDocument(), { timeout: 4000 });
+    await waitFor(() => expect(within(row("Amp")).getByRole("button", { name: "Remove" })).toBeInTheDocument(), {
+      timeout: 4000,
+    });
     expect(onChanged).toHaveBeenCalledTimes(1);
     expect(within(row("Cline")).getByRole("button", { name: "Update" })).toBeEnabled();
   });
@@ -314,9 +345,11 @@ describe("Agents settings page", () => {
   it("removes an installed agent", async () => {
     const backend = new FakeBackend();
     const onChanged = vi.fn();
-    renderRegistry(<AgentRegistryPage onChanged={onChanged} backend={backend} />);
+    renderRegistry(backend, onChanged);
     await waitFor(() => expect(row("fast-agent")).toBeInTheDocument());
     fireEvent.click(within(row("fast-agent")).getByRole("button", { name: "Remove" }));
+    const dialog = await screen.findByRole("dialog", { name: "Remove fast-agent" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(within(row("fast-agent")).getByRole("button", { name: "Install" })).toBeEnabled());
     expect(backend.removed).toEqual(["fast-agent"]);
     expect(onChanged).toHaveBeenCalledTimes(1);
@@ -325,21 +358,72 @@ describe("Agents settings page", () => {
   it("falls back to the saved list with a warning, and reports a registry it cannot load", async () => {
     const backend = new FakeBackend();
     backend.registry = { agents: AGENTS, warning: "Could not reach the ACP Registry" };
-    const { unmount } = renderRegistry(<AgentRegistryPage backend={backend} />);
+    const { unmount } = renderRegistry(backend);
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Could not reach the ACP Registry"));
     unmount();
 
     backend.list.mockRejectedValueOnce(new IpcError({ kind: "io", message: "offline" }));
-    renderRegistry(<AgentRegistryPage backend={backend} />);
+    renderRegistry(backend);
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Cannot load the ACP Registry: offline"));
+  });
+
+  it("prefers the live registry update version over a stale cached provider snapshot", async () => {
+    const backend = new FakeBackend();
+    backend.registry = {
+      agents: [
+        agent({ id: "copilot", name: "GitHub Copilot", version: "1.0.114", installed: "1.0.112", update: true }),
+        agent({ id: "cline", name: "Cline", version: "3.0.74", installed: "3.0.70", update: true }),
+      ],
+      warning: null,
+    };
+    const commands = new FakeCommands();
+    commands.list = [
+      {
+        ...claudeProvider("/tools/copilot/1.0.112/copilot"),
+        id: "copilot",
+        name: "GitHub Copilot",
+        commandEditable: false,
+        commandReadOnlyReason: "registry",
+        source: { kind: "registry", version: "1.0.112", update: "1.0.113" },
+      },
+      {
+        ...claudeProvider("/tools/cline/3.0.70/cline"),
+        id: "cline",
+        name: "Cline",
+        commandEditable: false,
+        commandReadOnlyReason: "registry",
+        source: { kind: "registry", version: "3.0.70", update: null },
+      },
+    ];
+    render(
+      <>
+        <AgentRegistryPage backend={backend} commandBackend={commands} />
+        <MessagesHost />
+      </>,
+    );
+
+    await waitFor(() => expect(within(row("GitHub Copilot")).getByText("1.0.114 is available")).toBeInTheDocument());
+    expect(within(row("GitHub Copilot")).queryByText("1.0.113 is available")).toBeNull();
+    expect(within(item("GitHub Copilot")).getByText("Update")).toBeInTheDocument();
+
+    await waitFor(() => expect(within(item("Cline")).getByText("Update")).toBeInTheDocument());
+    expect(within(row("Cline")).getByText("3.0.74 is available")).toBeInTheDocument();
+    expect(within(row("Cline")).getByRole("button", { name: "Update" })).toBeEnabled();
   });
 });
 
 class FakeCommands implements CommandsBackend {
+  checkCli = vi.fn<CommandsBackend["checkCli"]>();
+  updateCli = vi.fn<CommandsBackend["updateCli"]>();
+  cancel = vi.fn<CommandsBackend["cancel"]>();
   list: AgentProvider[] = [];
   saved: [string, string | null][] = [];
   providers = vi.fn(async () => this.list);
   chooseExecutable = vi.fn(async () => "/chosen/agent");
+  saveCustom = vi.fn(async () => {});
+  removeCustom = vi.fn(async () => {});
+  importAcp = vi.fn(async (): Promise<AcpImportOutcome[]> => []);
+  pickAcpJson = vi.fn(async (): Promise<string | null> => null);
   savedEnv: [string, Record<string, string>][] = [];
   async setEnv(id: string, env: Record<string, string>) {
     this.savedEnv.push([id, env]);
@@ -374,6 +458,7 @@ const claudeProvider = (command: string): AgentProvider => ({
   commandEditable: true,
   commandReadOnlyReason: null,
   installed: true,
+  canCheckCliUpdate: true,
   env: {},
   config: [],
   commands: [],
@@ -388,7 +473,7 @@ describe("Built-in executable overrides", () => {
     dispose();
   });
 
-  const openCommands = async (commands: FakeCommands, onChanged = vi.fn()) => {
+  const openCommands = async (commands: FakeCommands, onChanged = vi.fn(), name = "Claude Code") => {
     const backend = new FakeBackend();
     dispose = registerSettingsPage({
       id: REGISTRY_PAGE,
@@ -397,12 +482,51 @@ describe("Built-in executable overrides", () => {
       component: () => <RegistryPage backend={backend} commandBackend={commands} onChanged={onChanged} />,
     });
     render(<SettingsDialog />);
-    return screen.findByRole("region", { name: "Claude Code executable" });
+    return screen.findByRole("region", { name });
   };
   const apply = () => screen.getByRole("button", { name: "Apply" });
   const field = () => screen.getByRole("textbox", { name: "Executable" });
 
-  it("follows locale changes in tabs and renders login commands as inline code", async () => {
+  it("checks only on click and updates only after the user chooses the offered version", async () => {
+    const commands = new FakeCommands();
+    const provider = claudeProvider("claude");
+    const offer = { status: "available" as const, current: "1.0.0", latest: "1.1.0", prefix: "/usr/local" };
+    commands.list = [provider];
+    commands.checkCli.mockResolvedValueOnce(offer);
+    commands.updateCli.mockResolvedValueOnce({ status: "updated", current: "1.1.0" });
+    const panel = within(await openCommands(commands));
+    expect(commands.checkCli).not.toHaveBeenCalled();
+    fireEvent.click(panel.getByRole("button", { name: "Check for updates" }));
+    const update = await panel.findByRole("button", { name: "Update to 1.1.0" });
+    expect(commands.checkCli).toHaveBeenCalledOnce();
+    fireEvent.click(update);
+    await panel.findByText("Updated to 1.1.0. New sessions will use this version.");
+    expect(commands.updateCli).toHaveBeenCalledWith(provider.id, offer, expect.any(Number));
+    expect(commands.saved).toEqual([]);
+  });
+
+  it("cancels the in-progress update by its request id", async () => {
+    const commands = new FakeCommands();
+    commands.list = [claudeProvider("claude")];
+    commands.checkCli.mockResolvedValue({ status: "available", current: "1.0.0", latest: "1.1.0", prefix: "/test" });
+    let cancel!: () => void;
+    commands.updateCli.mockImplementation(
+      () =>
+        new Promise((_, reject) => {
+          cancel = () => reject(new IpcError({ kind: "cancelled", message: "cancelled" }));
+        }),
+    );
+    const panel = within(await openCommands(commands));
+    fireEvent.click(panel.getByRole("button", { name: "Check for updates" }));
+    fireEvent.click(await panel.findByRole("button", { name: "Update to 1.1.0" }));
+    fireEvent.click(panel.getByRole("button", { name: "Cancel" }));
+    expect(commands.cancel).toHaveBeenCalledWith(commands.updateCli.mock.calls[0]![2]);
+    await act(async () => cancel());
+    await waitFor(() => expect(panel.getByRole("button", { name: "Check for updates" })).toBeEnabled());
+    expect(panel.queryByRole("alert")).toBeNull();
+  });
+
+  it("follows locale changes and renders login commands as inline code", async () => {
     const commands = new FakeCommands();
     commands.list = [
       claudeProvider("claude"),
@@ -424,14 +548,10 @@ describe("Built-in executable overrides", () => {
         await setLocale("zh");
       });
       expect(screen.getByRole("option", { name: "Codex 未找到" })).toBeInTheDocument();
-      expect(screen.getByRole("tab", { name: "内置" })).toBeInTheDocument();
-      expect(screen.getByRole("tab", { name: "ACP 注册表" })).toBeInTheDocument();
       await act(async () => {
         await setLocale("en");
       });
       expect(screen.getByRole("option", { name: "Codex Not found" })).toBeInTheDocument();
-      expect(screen.getByRole("tab", { name: "Built-in" })).toBeInTheDocument();
-      expect(screen.getByRole("tab", { name: "ACP Registry" })).toBeInTheDocument();
     } finally {
       await act(async () => {
         await setLocale("en");
@@ -485,6 +605,38 @@ describe("Built-in executable overrides", () => {
     fireEvent.change(env(), { target: { value: "" } });
     await act(async () => fireEvent.click(apply()));
     expect(commands.savedEnv.at(-1)).toEqual(["claude", {}]);
+  });
+
+  it("writes a Copilot GitHub account without storing a token or exposing the control variable", async () => {
+    const commands = new FakeCommands();
+    commands.list = [
+      {
+        ...claudeProvider("copilot"),
+        id: "copilot",
+        name: "GitHub Copilot",
+        command: "copilot --acp",
+        defaultProgram: "copilot",
+        commandReadOnlyReason: "registry",
+        env: { COPILOT_TELEMETRY_OPTOUT: "1" },
+      },
+    ];
+    await openCommands(commands, vi.fn(), "GitHub Copilot");
+    const account = screen.getByRole("textbox", { name: "GitHub account" });
+    expect(screen.queryByRole("textbox", { name: "Environment variables" })).toBeNull();
+    fireEvent.change(account, { target: { value: "dengliu_microsoft" } });
+
+    await act(async () => fireEvent.click(apply()));
+
+    expect(commands.savedEnv).toEqual([
+      [
+        "copilot",
+        {
+          COPILOT_TELEMETRY_OPTOUT: "1",
+          OPENIDEA_COPILOT_GITHUB_ACCOUNT: "dengliu_microsoft",
+        },
+      ],
+    ]);
+    expect(JSON.stringify(commands.savedEnv)).not.toMatch(/gho_|ghp_|token/i);
   });
 
   it("Cancel discards command edits without writing", async () => {
@@ -651,5 +803,205 @@ describe("Built-in executable overrides", () => {
     expect(commands.saved).toEqual([]);
     await act(async () => fireEvent.click(apply()));
     expect(commands.saved).toEqual([["claude", "/chosen/agent"]]);
+  });
+});
+
+describe("the agent list", () => {
+  let dispose = () => {};
+  beforeEach(() => openSettings(REGISTRY_PAGE));
+  afterEach(() => {
+    closeSettings();
+    dispose();
+  });
+  const open = async (commands: FakeCommands, backend = new FakeBackend()) => {
+    dispose = registerSettingsPage({
+      id: REGISTRY_PAGE,
+      title: "Agents",
+      component: () => <RegistryPage backend={backend} commandBackend={commands} />,
+    });
+    render(
+      <>
+        <SettingsDialog />
+        <MessagesHost />
+      </>,
+    );
+    await screen.findByRole("region", { name: "Claude Code" });
+    return backend;
+  };
+  const model = {
+    id: "model",
+    name: "Model",
+    description: null,
+    category: "model",
+    current: "sonnet",
+    values: [
+      { value: "sonnet", name: "Sonnet", description: null },
+      { value: "opus", name: "Opus", description: null },
+    ],
+    via: "option",
+  } as AgentProvider["config"][number];
+
+  it("lists registry agents beside the built-ins, updates one and removes it", async () => {
+    const commands = new FakeCommands();
+    commands.list = [
+      claudeProvider("claude"),
+      {
+        ...claudeProvider("cline"),
+        id: "cline",
+        name: "Cline",
+        commandEditable: false,
+        commandReadOnlyReason: "registry",
+        source: { kind: "registry", version: "3.0.70", update: "3.0.74" },
+      },
+    ];
+    const backend = await open(commands);
+    fireEvent.mouseDown(screen.getByRole("option", { name: "Cline Update" }));
+    const details = await screen.findByRole("region", { name: "Cline" });
+    expect(within(details).getByText("ACP Registry · 3.0.70")).toBeInTheDocument();
+    fireEvent.click(within(details).getByRole("button", { name: "Update" }));
+    expect(backend.installs).toEqual(["cline"]);
+    await act(async () => backend.finish());
+    fireEvent.click(within(screen.getByRole("region", { name: "Cline" })).getByRole("button", { name: "Remove" }));
+    const dialog = await screen.findByRole("dialog", { name: "Remove Cline" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(backend.removed).toEqual(["cline"]));
+  });
+
+  it("lists every agent, installed first, and filters them", async () => {
+    const commands = new FakeCommands();
+    commands.list = [
+      claudeProvider("claude"),
+      {
+        ...claudeProvider("codex"),
+        id: "codex",
+        name: "Codex",
+        defaultProgram: "codex",
+        commandOverridden: false,
+        installed: false,
+      },
+    ];
+    await open(commands);
+    await waitFor(() => expect(screen.getByRole("option", { name: /^Amp/ })).toBeInTheDocument());
+    const names = screen.getAllByRole("option").map((o) => o.textContent?.trim());
+    expect(names).toEqual(["Claude Code", "Cline Update", "fast-agent", "Codex Not found", "Amp"]);
+    expect(screen.getByText("Installed")).toBeInTheDocument();
+    expect(screen.getByText("Available")).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("option", { name: /^Amp/ }));
+    const amp = screen.getByRole("region", { name: "Amp" });
+    expect(within(amp).getByRole("button", { name: "Install" })).toBeEnabled();
+    expect(within(amp).queryByRole("region", { name: "Launch" })).toBeNull();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search agents" }), { target: { value: "codex" } });
+    expect(screen.getAllByRole("option").map((o) => o.textContent?.trim())).toEqual(["Codex Not found"]);
+    expect(screen.queryByText("Installed")).toBeNull();
+  });
+
+  it("stages the settings new tasks start with", async () => {
+    const commands = new FakeCommands();
+    commands.list = [{ ...claudeProvider("claude"), config: [model] }];
+    await open(commands);
+    const select = screen.getByRole("button", { name: "Model" });
+    expect(select).toHaveTextContent("Agent's default (Sonnet)");
+    fireEvent.click(select);
+    fireEvent.click(await screen.findByRole("option", { name: "Opus" }));
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Opus");
+  });
+
+  it("says when an agent's settings aren't known yet", async () => {
+    const commands = new FakeCommands();
+    commands.list = [claudeProvider("claude")];
+    await open(commands);
+    expect(screen.getByText(/after its first session/)).toBeInTheDocument();
+  });
+});
+
+describe("custom agents", () => {
+  let dispose = () => {};
+  beforeEach(() => openSettings(REGISTRY_PAGE));
+  afterEach(() => {
+    closeSettings();
+    dispose();
+  });
+
+  const customProvider = (): AgentProvider => ({
+    ...claudeProvider("/opt/mine"),
+    id: "mine",
+    name: "Mine",
+    args: ["acp"],
+    defaultProgram: null,
+    defaultArgs: [],
+    loginHint: null,
+    commandEditable: false,
+    commandReadOnlyReason: "customAgent",
+    source: { kind: "custom" },
+  });
+
+  const openList = (commands: FakeCommands) => {
+    const backend = new FakeBackend();
+    dispose = registerSettingsPage({
+      id: REGISTRY_PAGE,
+      title: "Agents",
+      group: "Tools",
+      component: () => <RegistryPage backend={backend} commandBackend={commands} />,
+    });
+    render(
+      <>
+        <SettingsDialog />
+        <MessagesHost />
+      </>,
+    );
+  };
+
+  it("adds a custom agent through the modal, suggesting the id", async () => {
+    const commands = new FakeCommands();
+    openList(commands);
+    await waitFor(() => expect(commands.providers).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Add Custom Agent…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Custom Agent" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Name" }), { target: { value: "My Agent" } });
+    expect(within(dialog).getByRole("textbox", { name: "ID" })).toHaveValue("my-agent");
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Command" }), {
+      target: { value: "/opt/mine" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+    await waitFor(() =>
+      expect(commands.saveCustom).toHaveBeenCalledWith({
+        id: "my-agent",
+        name: "My Agent",
+        command: "/opt/mine",
+        args: [],
+        env: {},
+      }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Add Custom Agent" })).toBeNull());
+    expect(commands.providers.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("removes a custom agent after asking", async () => {
+    const commands = new FakeCommands();
+    commands.list = [customProvider()];
+    openList(commands);
+    await waitFor(() => expect(row("Mine")).toBeInTheDocument());
+    fireEvent.click(within(row("Mine")).getByRole("button", { name: "Remove" }));
+    const dialog = await screen.findByRole("dialog", { name: "Remove Mine" });
+    expect(dialog).toHaveTextContent("Remove Mine and delete its agent file?");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(commands.removeCustom).toHaveBeenCalledWith("mine"));
+    expect(commands.providers.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("imports acp.json and reports saved and skipped entries", async () => {
+    const commands = new FakeCommands();
+    commands.pickAcpJson.mockResolvedValueOnce('{"agent_servers": {}}');
+    commands.importAcp.mockResolvedValueOnce([
+      { name: "My Agent", id: "my-agent", saved: true, reason: "" },
+      { name: "Taken", id: "taken", saved: false, reason: "there is already a custom agent 'taken'" },
+    ]);
+    openList(commands);
+    await waitFor(() => expect(commands.providers).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Import acp.json" }));
+    await screen.findByText(
+      "Imported My Agent from acp.json. Skipped Taken (there is already a custom agent 'taken').",
+    );
+    expect(commands.importAcp).toHaveBeenCalledTimes(1);
   });
 });

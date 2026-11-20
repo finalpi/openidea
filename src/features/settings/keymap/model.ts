@@ -3,43 +3,46 @@
  * (plugins' default shortcuts count as the preset's), add / remove / reset,
  * conflict detection with `when` overlap, and shortcut search.
  */
-import type { Action } from "@/platform/actions";
+import { allActions, type Action } from "@/platform/actions";
 import { evaluateWhen, type ContextKeys } from "@/platform/context";
-import { defaultPreset, normalizeBinding, PRESET_TITLES, PRESETS, useKeymap, type Keymap } from "@/platform/keymap";
+import {
+  customKeymapId,
+  defaultPreset,
+  normalizeBinding,
+  presetBindings,
+  PRESET_TITLES,
+  PRESETS,
+  useKeymap,
+  withBindings,
+  type Keymap,
+  type KeymapDraft,
+} from "@/platform/keymap";
 
-export interface KeymapDraft {
-  preset: string;
-  overrides: Keymap;
-}
+export { presetBindings, withBindings, type KeymapDraft };
 
-/**
- * The defaults of `id`: the preset's, or for an action the preset leaves out,
- * the shortcut its plugin declares (`keymaps`). Removing or changing one is an
- * override like any other.
- */
-export function presetBindings(preset: string, id: string): string[] {
-  const own = PRESETS[preset];
-  const keys = own && id in own ? own[id] : useKeymap.getState().extensions?.[id];
-  return (keys ?? []).map(normalizeBinding);
+export function keymapSearchLabels(): string[] {
+  const draft = useKeymap.getState();
+  return allActions()
+    .filter((a) => isKeymapAction(a, draft))
+    .map((a) => a.title);
 }
 
 export function resolveBindings(draft: KeymapDraft, id: string): string[] {
   return draft.overrides[id]?.map(normalizeBinding) ?? presetBindings(draft.preset, id);
 }
 
-export function isModified(draft: KeymapDraft, id: string): boolean {
-  return id in draft.overrides;
+/** Hidden actions with shortcuts stay configurable even after their bindings are removed. */
+export function isKeymapAction(action: Action, draft: KeymapDraft): boolean {
+  return (
+    !action.hidden ||
+    !!action.keymap ||
+    action.id in draft.overrides ||
+    presetBindings(draft.preset, action.id).length > 0
+  );
 }
 
-const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
-
-/** Sets the full binding list of `id`; drops the override when it equals the preset. */
-export function withBindings(draft: KeymapDraft, id: string, bindings: readonly string[]): Keymap {
-  const list = [...new Set(bindings.map(normalizeBinding))];
-  const overrides = { ...draft.overrides };
-  if (sameList(list, presetBindings(draft.preset, id))) delete overrides[id];
-  else overrides[id] = list;
-  return overrides;
+export function isModified(draft: KeymapDraft, id: string): boolean {
+  return id in draft.overrides;
 }
 
 export function addBinding(draft: KeymapDraft, id: string, binding: string): Keymap {
@@ -225,24 +228,13 @@ export function validateKeymapName(name: string, customs: CustomKeymaps, ownId?:
   return clash ? `Keymap '${n}' already exists` : null;
 }
 
-function newKeymapId(name: string, customs: CustomKeymaps): string {
-  const slug =
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "") || "keymap";
-  let id = `custom.${slug}`;
-  for (let i = 2; customs[id] || PRESETS[id]; i++) id = `custom.${slug}-${i}`;
-  return id;
-}
-
 /** Copies the selected keymap (its effective overrides) under `name`; returns the new id. */
 export function duplicateKeymap(
   draft: KeymapDraft,
   customs: CustomKeymaps,
   name: string,
 ): { id: string; customs: CustomKeymaps } {
-  const id = newKeymapId(name, customs);
+  const id = customKeymapId(name, customs);
   return {
     id,
     customs: { ...customs, [id]: { name: name.trim(), parent: draft.preset, overrides: { ...draft.overrides } } },

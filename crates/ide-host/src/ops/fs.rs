@@ -1,10 +1,13 @@
 use super::Channel;
 use crate::Host;
-use ide_core::{IdeResult, RequestId};
+use ide_command::command;
+use ide_core::{IdeError, IdeResult, RequestId};
 use ide_vfs::FileEntry;
-use std::path::PathBuf;
+use ide_workspace::DeletionUndo;
+use std::path::{Path, PathBuf};
 
-pub async fn entry_kind(host: &Host, path: PathBuf) -> IdeResult<ide_vfs::EntryKind> {
+#[command(trust = always)]
+pub async fn fs_entry_kind(host: &Host, path: PathBuf) -> IdeResult<ide_vfs::EntryKind> {
     host.blocking(move || {
         let meta = std::fs::metadata(path)?;
         Ok(if meta.is_dir() { ide_vfs::EntryKind::Dir } else { ide_vfs::EntryKind::File })
@@ -12,7 +15,8 @@ pub async fn entry_kind(host: &Host, path: PathBuf) -> IdeResult<ide_vfs::EntryK
     .await
 }
 
-pub async fn compare_directories(
+#[command(trust = always)]
+pub async fn fs_compare_directories(
     host: &Host,
     window: &str,
     left: PathBuf,
@@ -38,7 +42,8 @@ pub async fn compare_directories(
     result
 }
 
-pub async fn copy_merge(
+#[command(trust = always)]
+pub async fn fs_copy_merge(
     host: &Host,
     window: &str,
     source_root: PathBuf,
@@ -73,8 +78,9 @@ pub async fn copy_merge(
 /// Files of a deleted folder snapshotted in Local History.
 const DELETE_SNAPSHOT_LIMIT: usize = 2000;
 
-/// Runs on the blocking pool: on a network share (`\\wsl.localhost`) every stat is slow.
-pub async fn read_dir(host: &Host, window: &str, path: PathBuf) -> IdeResult<Vec<FileEntry>> {
+#[command(trust = always)]
+pub async fn fs_read_dir(host: &Host, window: &str, path: PathBuf) -> IdeResult<Vec<FileEntry>> {
+    // Runs on the blocking pool: on a network share (`\\wsl.localhost`) every stat is slow.
     let project = host.project(window);
     host.blocking(move || {
         let excludes = project
@@ -99,7 +105,8 @@ pub async fn read_dir(host: &Host, window: &str, path: PathBuf) -> IdeResult<Vec
 
 /// Creates an empty file; inside a project, honours the EditorConfig
 /// `charset` (writes the BOM for `utf-8-bom` / UTF-16).
-pub fn create_file(host: &Host, window: &str, path: PathBuf) -> IdeResult<()> {
+#[command(trust = always)]
+pub fn fs_create_file(host: &Host, window: &str, path: PathBuf) -> IdeResult<()> {
     match host.project(window) {
         Ok(p) => {
             let defaults = p.documents.file_defaults();
@@ -114,50 +121,125 @@ pub fn create_file(host: &Host, window: &str, path: PathBuf) -> IdeResult<()> {
             if empty && !bom.is_empty() {
                 std::fs::write(&path, bom)?;
             }
+            // A checkout backend opens the file for add; Git's hook is a no-op.
+            if let Err(e) = p.with_backend_of(&path, |r| r.files_added(std::slice::from_ref(&path))) {
+                tracing::debug!("vcs files_added for {}: {e}", path.display());
+            }
             Ok(())
         }
         Err(_) => ide_vfs::create_file(&path),
     }
 }
 
-pub async fn create_file_bytes(host: &Host, path: PathBuf, data: Vec<u8>) -> IdeResult<()> {
-    host.blocking(move || ide_vfs::create_file_bytes(&path, &data)).await
+#[command(trust = always)]
+pub async fn fs_create_file_bytes(host: &Host, window: &str, path: PathBuf, data: Vec<u8>) -> IdeResult<()> {
+    let project = host.project(window).ok();
+    host.blocking(move || {
+        ide_vfs::create_file_bytes(&path, &data)?;
+        if let Some(p) = project
+            && let Err(e) = p.with_backend_of(&path, |r| r.files_added(std::slice::from_ref(&path)))
+        {
+            tracing::debug!("vcs files_added for {}: {e}", path.display());
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[command(trust = always)]
+pub fn fs_create_dir(path: PathBuf) -> IdeResult<()> {
+    ide_vfs::create_dir(&path)
 }
 
 /// Toggle Read-only Attribute: sets the writable bit (and the open document's
 /// state). Returns whether the file is read-only now.
-pub fn set_writable(host: &Host, window: &str, path: PathBuf, writable: bool) -> IdeResult<bool> {
+#[command(trust = always)]
+pub fn fs_set_writable(host: &Host, window: &str, path: PathBuf, writable: bool) -> IdeResult<bool> {
     match host.project(window) {
         Ok(p) => p.documents.set_writable(&path, writable),
         Err(_) => ide_vfs::set_writable(&path, writable).map(|()| !writable),
     }
 }
 
-/// Moves to the trash; Local History keeps the contents so deleted files can be restored.
-pub async fn delete(host: &Host, window: &str, path: PathBuf) -> IdeResult<()> {
-    let history = host.project(window).ok().map(|p| p.history.clone());
+/// Moving to the trash can take a while (large trees): kept off the main thread.
+#[command(trust = always)]
+pub async fn fs_delete(host: &Host, window: &str, path: PathBuf) -> IdeResult<()> {
+    delete_with_history(host, window, path, false).await.map(|_| ())
+}
+
+/// Moves an item to the Trash and returns the snapshot for Project View Undo.
+#[command(trust = always)]
+pub async fn fs_delete_with_undo(host: &Host, window: &str, path: PathBuf) -> IdeResult<DeletionUndo> {
+    delete_with_history(host, window, path, true).await
+}
+
+async fn delete_with_history(host: &Host, window: &str, path: PathBuf, undoable: bool) -> IdeResult<DeletionUndo> {
+    let project = if undoable { Some(host.project(window)?) } else { host.project(window).ok() };
     host.blocking(move || {
         let paths = ide_workspace::file_ops::deletion_paths(&path)?;
-        if let Some(h) = history {
-            for p in paths {
-                h.record_deletion(&p, DELETE_SNAPSHOT_LIMIT);
+        let mut undo = DeletionUndo::default();
+        if let Some(p) = &project {
+            if undoable {
+                undo = p.history.capture_deletion_undo(&paths, DELETE_SNAPSHOT_LIMIT);
+            } else {
+                for pth in &paths {
+                    p.history.record_deletion(pth, DELETE_SNAPSHOT_LIMIT);
+                }
             }
         }
-        ide_workspace::file_ops::delete(&path)
+        ide_workspace::file_ops::delete(&path)?;
+        // A checkout backend opens the paths for delete; Git's hook is a no-op.
+        if let Some(p) = project {
+            let _ = p.with_backend_of(&path, |r| r.files_deleted(&paths));
+        }
+        Ok(undo)
     })
     .await
 }
 
-pub async fn copy(host: &Host, from: PathBuf, to: PathBuf) -> IdeResult<()> {
-    host.blocking(move || ide_workspace::file_ops::copy(&from, &to)).await
+#[command(trust = always)]
+pub async fn fs_undo_delete(host: &Host, window: &str, undo: DeletionUndo) -> IdeResult<Vec<ide_core::IpcPath>> {
+    let project = host.project(window)?;
+    host.blocking(move || Ok(project.history.restore_deletion_undo(undo))).await
 }
 
-pub async fn rename(host: &Host, from: PathBuf, to: PathBuf) -> IdeResult<()> {
-    host.blocking(move || ide_workspace::file_ops::rename(&from, &to)).await
+#[command(trust = always)]
+pub async fn fs_copy(host: &Host, window: &str, from: PathBuf, to: PathBuf) -> IdeResult<()> {
+    let project = host.project(window).ok();
+    host.blocking(move || {
+        ide_workspace::file_ops::copy(&from, &to)?;
+        // A copy is an add at the destination; Git's hook is a no-op.
+        if let Some(p) = project
+            && let Err(e) = p.with_backend_of(&to, |r| r.files_added(std::slice::from_ref(&to)))
+        {
+            tracing::debug!("vcs files_added for {}: {e}", to.display());
+        }
+        Ok(())
+    })
+    .await
 }
 
-/// Reads a text file without opening it as a document; prefers the unsaved buffer.
-pub async fn read_text(host: &Host, window: &str, path: PathBuf) -> IdeResult<String> {
+#[command(trust = always)]
+pub async fn fs_rename(host: &Host, window: &str, from: PathBuf, to: PathBuf) -> IdeResult<()> {
+    let project = host.project(window).ok();
+    host.blocking(move || {
+        ide_workspace::file_ops::rename(&from, &to)?;
+        // A checkout backend records the rename so history follows the file;
+        // Git's hook is a no-op.
+        if let Some(p) = project
+            && let Err(e) = p.with_backend_of(&to, |r| r.file_moved(&from, &to))
+        {
+            tracing::debug!("vcs file_moved {} → {}: {e}", from.display(), to.display());
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Reads a text file without opening it as a document (previews, quick
+/// definition). Prefers the unsaved buffer when the file is open.
+#[command(trust = always)]
+pub async fn fs_read_text(host: &Host, window: &str, path: PathBuf) -> IdeResult<String> {
     let project = host.project(window).ok();
     host.blocking(move || match project {
         Some(p) => p.text_of(&path),
@@ -165,3 +247,64 @@ pub async fn read_text(host: &Host, window: &str, path: PathBuf) -> IdeResult<St
     })
     .await
 }
+
+/// The file `window` may hand to the OS's default application: `path` itself, resolved, when it is a
+/// file inside the window's project (its folder or a content root). The window must be trusted and
+/// open locally; a remote window's files live on its own machine and are not launched here.
+pub fn system_open_target(host: &Host, window: &str, path: PathBuf) -> IdeResult<PathBuf> {
+    host.require_trust(window)?;
+    let project = host.project(window)?;
+    let real =
+        dunce::canonicalize(&path).map_err(|_| IdeError::not_found(format!("{}: no such file", path.display())))?;
+    if !real.is_file() {
+        return Err(IdeError::invalid(format!("{}: not a file", path.display())));
+    }
+    let roots: Vec<PathBuf> = std::iter::once(project.root.clone())
+        .chain(project.content_roots())
+        .filter_map(|root| dunce::canonicalize(root).ok())
+        .collect();
+    if !inside_any_root(&real, &roots) {
+        return Err(IdeError::invalid(format!("{}: outside the project", path.display())));
+    }
+    Ok(real)
+}
+
+/// Whether `path` lies inside one of `roots`, comparing whole path components (`/a/bc` is not inside `/a/b`).
+pub(crate) fn inside_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inside_any_root;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn system_open_is_limited_to_paths_inside_a_project_root() {
+        let roots = vec![PathBuf::from("/work/app"), PathBuf::from("/work/shared")];
+        assert!(inside_any_root(Path::new("/work/app/docs/spec.pdf"), &roots));
+        assert!(inside_any_root(Path::new("/work/shared/a.docx"), &roots));
+        assert!(inside_any_root(Path::new("/work/app"), &roots));
+        assert!(!inside_any_root(Path::new("/work/app2/spec.pdf"), &roots));
+        assert!(!inside_any_root(Path::new("/home/me/.ssh/id_rsa"), &roots));
+        assert!(!inside_any_root(Path::new("/work/spec.pdf"), &[]));
+    }
+}
+
+ide_command::domain!(
+    fs:
+    fs_compare_directories,
+    fs_copy,
+    fs_copy_merge,
+    fs_create_dir,
+    fs_create_file,
+    fs_create_file_bytes,
+    fs_delete,
+    fs_delete_with_undo,
+    fs_entry_kind,
+    fs_read_dir,
+    fs_read_text,
+    fs_rename,
+    fs_set_writable,
+    fs_undo_delete,
+);

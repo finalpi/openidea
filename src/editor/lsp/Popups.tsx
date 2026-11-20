@@ -1,5 +1,5 @@
 /** React popups for LSP editor features, rendered as a workbench overlay. */
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import clsx from "clsx";
 import {
   Checkbox,
@@ -11,7 +11,9 @@ import {
   List,
   MenuList,
   Popup,
+  Radio,
   Select,
+  Spinner,
   SymbolBadge,
   fileIconName,
   fuzzyMatch,
@@ -28,21 +30,15 @@ import {
   type ListPreview,
   type LspPopup,
 } from "./popupStore";
-import { shortcutLabel } from "@/platform/keymap";
-import {
-  docLinkHandler,
-  docStep,
-  editDocSource,
-  moveDocPopupToWindow,
-  useDocWindow,
-  type DocHistory,
-  type DocHost,
-} from "./docs";
-import { renderCode, renderMarkup } from "./markdown";
+import { DOC_MIN_HEIGHT, DOC_MIN_WIDTH, loadDocSize, saveDocSize, useDocWindow } from "./docs";
+import { DocView, DomContent } from "./DocView";
+import { renderCode } from "./markdown";
 import { describeSummary } from "./workspaceEdit";
 import { useUsagesStatus } from "./navigation";
 import styles from "./Popups.module.css";
+import fieldsetStyles from "@/ui/DialogFieldset.module.css";
 import { tx } from "@/platform/i18n";
+import { executeAction } from "@/platform/actions";
 
 export function BulbIcon({ fix }: { fix?: boolean }) {
   return <Icon name={fix ? "bulb-fix" : "bulb"} size={16} className={styles.bulb} />;
@@ -55,11 +51,17 @@ function ItemIcon({ item }: { item: ListPopupItem }) {
   return <span className={styles.iconSpacer} />;
 }
 
-function ListPreviewPanel({ preview }: { preview: ListPreview | null | "loading" }) {
+function ListPreviewPanel({
+  preview,
+  themeClasses,
+}: {
+  preview: ListPreview | null | "loading";
+  themeClasses?: string;
+}) {
   if (preview === "loading") return <div className={styles.previewPanel} aria-busy="true" />;
   if (!preview) return null;
   return (
-    <div className={styles.previewPanel} aria-label={tx("Preview")}>
+    <div className={clsx(styles.previewPanel, themeClasses)} role="region" aria-label={tx("Preview")}>
       {preview.kind === "text" ? (
         <div className={styles.previewText}>{preview.text}</div>
       ) : (
@@ -75,6 +77,9 @@ function ListPreviewPanel({ preview }: { preview: ListPreview | null | "loading"
     </div>
   );
 }
+
+const LIST_PREVIEW_WIDTH = 420;
+const MIN_SIDE_BY_SIDE_WIDTH = 660;
 
 function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
   const [query, setQuery] = useState("");
@@ -97,6 +102,13 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
 
   const [preview, setPreview] = useState<{ id: string; data: ListPreview | null } | null>(null);
   const fetchPreview = popup.preview;
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  useEffect(() => {
+    if (!fetchPreview) return;
+    const resize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, [fetchPreview]);
   useEffect(() => {
     if (!fetchPreview || !activeItem || activeItem.disabled) return;
     const ctrl = new AbortController();
@@ -170,19 +182,49 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
         ? ("loading" as const)
         : null
     : null;
+  const hasPreview = shownPreview !== null;
+  const previewBelow = hasPreview && viewportWidth <= MIN_SIDE_BY_SIDE_WIDTH;
+  const previewLeft =
+    hasPreview &&
+    !previewBelow &&
+    popup.anchor.x + width + LIST_PREVIEW_WIDTH > viewportWidth - 6 &&
+    popup.anchor.x >= LIST_PREVIEW_WIDTH + 6;
+  const anchor = useMemo(() => {
+    if (!fetchPreview) return popup.anchor;
+    const x = popup.anchor.x - (previewLeft ? LIST_PREVIEW_WIDTH : 0);
+    return {
+      getBoundingClientRect: () =>
+        new DOMRect(
+          Math.max(0, Math.min(x, window.innerWidth)),
+          Math.max(0, Math.min(popup.anchor.y, window.innerHeight)),
+          0,
+          0,
+        ),
+    };
+  }, [fetchPreview, popup.anchor, previewLeft]);
+  const popupSize = {
+    width: hasPreview ? width + LIST_PREVIEW_WIDTH : width,
+    "--list-preview-width": `${LIST_PREVIEW_WIDTH}px`,
+  } as CSSProperties;
   const indexOf = (item: ListPopupItem) => popup.items.indexOf(item);
   return (
     <Popup
       open
-      anchor={popup.anchor}
+      anchor={anchor}
       onClose={closePopup}
       aria-label={popup.title}
-      className={clsx(styles.listPopup, popup.preview && styles.withPreview)}
-      style={popup.preview ? undefined : { width }}
+      className={clsx(
+        styles.listPopup,
+        hasPreview && styles.withPreview,
+        previewBelow && styles.previewBelow,
+        previewLeft && styles.previewLeft,
+      )}
+      style={popupSize}
     >
-      <div className={styles.listMain} style={popup.preview ? { width } : undefined}>
+      <div className={styles.listMain} data-testid="list-popup" aria-busy={popup.busy || undefined}>
         <div className={styles.listHeader}>
           <span className={styles.listTitle}>{popup.title}</span>
+          {popup.busy && <Spinner size={12} />}
           {query && <span className={styles.query}>{query}</span>}
           {popup.pin && (
             <IconButton
@@ -204,12 +246,19 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
             activeIndex={activeIndex}
             onActiveChange={setActive}
             hoverSelects
+            autoFocus
             aria-label={popup.title}
             onActivate={(r) => activate(r.item)}
             empty={
-              <span className={styles.empty}>
-                <T>Nothing matches</T>
-              </span>
+              popup.busy ? (
+                <span className={styles.empty}>
+                  <T>Computing…</T>
+                </span>
+              ) : (
+                <span className={styles.empty}>
+                  <T>Nothing matches</T>
+                </span>
+              )
             }
             renderItem={({ item, match }) => {
               const n = popup.numbered && !query ? indexOf(item) + 1 : 0;
@@ -217,11 +266,18 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
                 <div
                   className={clsx(styles.item, item.disabled && styles.disabled, item.emphasis && styles.emphasis)}
                   title={item.disabled ?? undefined}
+                  data-testid="list-popup-item"
+                  data-path={item.location?.path}
+                  data-line={item.location?.line}
                 >
                   {popup.numbered && <span className={styles.mnemonic}>{n > 0 && n <= 9 ? n : ""}</span>}
                   <ItemIcon item={item} />
                   <HighlightedText className={styles.label} text={item.label} indices={match} tone="accent" />
-                  {item.preview && <span className={styles.preview}>{item.preview}</span>}
+                  {item.preview && (
+                    <span className={styles.preview} title={item.preview}>
+                      {item.preview}
+                    </span>
+                  )}
                   <span className={styles.spacer} />
                   {item.detail && <span className={styles.detail}>{item.detail}</span>}
                   {item.shortcut && <span className={styles.shortcut}>{item.shortcut}</span>}
@@ -246,7 +302,7 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
           />
         </div>
       </div>
-      {popup.preview && <ListPreviewPanel preview={shownPreview} />}
+      {popup.preview && <ListPreviewPanel preview={shownPreview} themeClasses={popup.themeClasses} />}
       {sub?.item.submenu && (
         <Popup
           open
@@ -338,87 +394,51 @@ function RenamePopup({ popup }: { popup: Extract<LspPopup, { kind: "rename" }> }
   );
 }
 
-function DomContent({ build, className }: { build: () => HTMLElement; className?: string }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const node = build();
-    el.replaceChildren(node);
-    return () => el.replaceChildren();
-    // Built once per popup.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  return <div ref={ref} className={className} />;
-}
-
-/** Documentation with its history toolbar; shared by the popup and the Documentation tool window. */
-function DocView({ host, history, themeClasses }: { host: DocHost; history: DocHistory; themeClasses: string }) {
-  const entry = history.entries[history.index];
-  const onKeyDown = (e: KeyboardEvent) => {
-    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-      e.preventDefault();
-      docStep(host, e.key === "ArrowLeft" ? -1 : 1);
-    } else if (e.key === "F4" && entry?.source) {
-      e.preventDefault();
-      void editDocSource(host);
-    }
-  };
-  const ref = useRef<HTMLDivElement>(null);
+function SymbolRenameDialog({ popup }: { popup: Extract<LspPopup, { kind: "symbolRename" }> }) {
+  const [value, setValue] = useState(popup.initial);
+  const field = useId();
+  const name = value.trim();
   return (
-    <div
-      ref={ref}
-      tabIndex={-1}
-      data-lsp-doc={host}
-      className={clsx(themeClasses, host === "popup" ? styles.docFrame : styles.docWindowFrame)}
-      onKeyDown={onKeyDown}
+    <Dialog
+      open
+      title="Rename"
+      aria-label={popup.title}
+      onClose={closePopup}
+      blockWorkbenchShortcuts
+      width={440}
+      buttons={[
+        {
+          label: "Rename",
+          role: "default",
+          disabled: !name,
+          onClick: () => {
+            closePopup();
+            popup.onSubmit(name);
+          },
+        },
+        { label: "Cancel", role: "cancel" },
+      ]}
     >
-      {entry && (
-        <DomContent
-          key={`${history.index}:${history.entries.length}`}
-          className={clsx(styles.docBody, selectableText)}
-          build={() => renderMarkup(entry.markup, entry.language, docLinkHandler(host))}
-        />
-      )}
-      <div className={styles.docToolbar}>
-        <IconButton
-          icon="arrow-left"
-          size="small"
-          title="Back"
-          shortcut="←"
-          disabled={history.index === 0}
-          onClick={() => docStep(host, -1)}
-        />
-        <IconButton
-          icon="arrow-right"
-          size="small"
-          title="Forward"
-          shortcut="→"
-          disabled={history.index >= history.entries.length - 1}
-          onClick={() => docStep(host, 1)}
-        />
-        <span className={styles.spacer} />
-        {entry?.source && (
-          <IconButton
-            icon="edit"
-            size="small"
-            title="Edit Source"
-            shortcut="F4"
-            onClick={() => void editDocSource(host)}
+      <div className={popup.themeClasses}>
+        <div className={styles.symbolRename}>
+          <div className={styles.renameContext}>{popup.title}</div>
+          <label htmlFor={field}>
+            <T>New name</T>
+          </label>
+          <Input
+            id={field}
+            className={styles.renameField}
+            mono
+            data-autofocus
+            autoSelect
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            invalid={!name}
           />
-        )}
-        {host === "popup" && (
-          <IconButton
-            icon="open-in-tool-window"
-            size="small"
-            title="Show in Documentation Tool Window"
-            shortcut={shortcutLabel("code.quickDocumentation") || undefined}
-            onClick={() => moveDocPopupToWindow()}
-          />
-        )}
+          {popup.note && <div className={styles.symbolRenameNote}>{popup.note}</div>}
+        </div>
       </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -426,21 +446,40 @@ function DocPopup({ popup }: { popup: Extract<LspPopup, { kind: "doc" }> }) {
   const focusSeq = useLspPopup((s) => s.focusSeq);
   const scope = useRef<HTMLDivElement>(null);
   const opened = useRef(focusSeq);
+  // The captured caret can end up outside the viewport while the popup is open.
+  const anchor = useMemo(
+    () => ({
+      getBoundingClientRect: () =>
+        new DOMRect(
+          Math.max(0, Math.min(popup.anchor.x, window.innerWidth)),
+          Math.max(0, Math.min(popup.anchor.y, window.innerHeight)),
+          0,
+          0,
+        ),
+    }),
+    [popup.anchor],
+  );
   useEffect(() => {
     if (focusSeq !== opened.current)
       scope.current?.querySelector<HTMLElement>("[data-lsp-doc]")?.focus({ preventScroll: true });
   }, [focusSeq]);
+  const [initialSize] = useState(loadDocSize);
   return (
     <Popup
       open
-      anchor={popup.anchor}
+      anchor={anchor}
       onClose={closePopup}
       aria-label="Documentation"
       className={styles.docPopup}
       // As in IDEA the popup leaves the keyboard to the editor until F1 focuses it.
       autoFocus={false}
+      resizable="both"
+      minWidth={DOC_MIN_WIDTH}
+      minHeight={DOC_MIN_HEIGHT}
+      initialSize={initialSize}
+      onResized={saveDocSize}
     >
-      <div ref={scope} className={styles.docScope}>
+      <div ref={scope} data-testid="doc-popup" className={styles.docScope}>
         <DocView host="popup" history={popup} themeClasses={popup.themeClasses} />
       </div>
     </Popup>
@@ -527,15 +566,44 @@ function DefinitionPopup({ popup }: { popup: Extract<LspPopup, { kind: "definiti
   );
 }
 
+const PREVIEW_SIZE_KEY = "openidea.refactor.previewSize";
+
+function loadPreviewSize(): { w: number; h: number } | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(PREVIEW_SIZE_KEY) ?? "null") as { w?: unknown; h?: unknown } | null;
+    return typeof v?.w === "number" && typeof v.h === "number" ? { w: v.w, h: v.h } : null;
+  } catch {
+    return null;
+  }
+}
+
+function savePreviewSize(size: { w: number; h: number }) {
+  try {
+    localStorage.setItem(PREVIEW_SIZE_KEY, JSON.stringify(size));
+  } catch {
+    // Private mode etc. — the size just isn't remembered.
+  }
+}
+
 function PreviewDialog({ popup }: { popup: Extract<LspPopup, { kind: "preview" }> }) {
+  const rename = popup.renameThemeClasses !== undefined;
   const root = useProject((s) => s.project?.root ?? "");
   const { summary } = popup;
+  const [initialSize] = useState(loadPreviewSize);
   return (
     <Dialog
       open
       onClose={closePopup}
-      title={popup.title}
+      title={rename ? "Rename" : popup.title}
+      aria-label={popup.title}
+      className={clsx(styles.previewDialog, rename && styles.renamePreview)}
       width={560}
+      minWidth={400}
+      minHeight={220}
+      maxHeight={480}
+      resizable="both"
+      initialSize={initialSize}
+      onResized={savePreviewSize}
       buttons={[
         {
           label: popup.confirmLabel,
@@ -549,6 +617,7 @@ function PreviewDialog({ popup }: { popup: Extract<LspPopup, { kind: "preview" }
         { label: "Cancel", role: "cancel" },
       ]}
     >
+      {rename && <div className={styles.previewContext}>{popup.title}</div>}
       {popup.warnings?.map((w) => (
         <div key={w} className={styles.previewWarning} role="note">
           <Icon name="warning" size={14} />
@@ -557,7 +626,10 @@ function PreviewDialog({ popup }: { popup: Extract<LspPopup, { kind: "preview" }
       ))}
       <div className={styles.previewSummary}>{describeSummary(summary)}</div>
       {popup.occurrences ? (
-        <ul className={styles.previewList} aria-label={tx("Occurrences")}>
+        <ul
+          className={clsx(styles.previewList, styles.previewOccurrences, popup.renameThemeClasses)}
+          aria-label={tx("Occurrences")}
+        >
           {popup.occurrences.map((o, i) => {
             const lead = o.text.length - o.text.trimStart().length;
             const text = o.text.trim();
@@ -576,12 +648,16 @@ function PreviewDialog({ popup }: { popup: Extract<LspPopup, { kind: "preview" }
           })}
         </ul>
       ) : (
-        <ul className={styles.previewList} aria-label={tx("Changes")}>
+        <ul data-testid="refactor-preview" className={styles.previewList} aria-label={tx("Changes")}>
           {summary.entries.map((e) => (
             <li key={e.path} className={styles.previewRow}>
               <Icon name={fileIconName(basename(e.path), e.path)} size={14} className={styles.itemIcon} />
-              <span className={styles.previewName}>{basename(e.path)}</span>
-              <span className={styles.previewPath}>{relativePath(root, e.path)}</span>
+              <span className={styles.previewName} title={relativePath(root, e.path)}>
+                {basename(e.path)}
+              </span>
+              <span className={styles.previewPath} title={relativePath(root, e.path)}>
+                {relativePath(root, e.path)}
+              </span>
               <span className={styles.spacer} />
               {e.operation === "rename" && e.to && <span className={styles.previewOp}>→ {basename(e.to)}</span>}
               {e.operation && e.operation !== "rename" && <span className={styles.previewOp}>{e.operation}</span>}
@@ -607,7 +683,7 @@ function ReformatDialog({ popup }: { popup: Extract<LspPopup, { kind: "reformat"
       open
       onClose={closePopup}
       title={popup.title}
-      width={380}
+      width={400}
       buttons={[
         {
           label: "Run",
@@ -621,36 +697,76 @@ function ReformatDialog({ popup }: { popup: Extract<LspPopup, { kind: "reformat"
         { label: "Cancel", role: "cancel" },
       ]}
     >
-      <fieldset className={styles.reformatGroup}>
-        <legend className={styles.reformatLegend}>
-          <T>Scope</T>
-        </legend>
-        <label className={styles.reformatOption}>
-          <input type="radio" name="reformat-scope" checked={!selectionOnly} onChange={() => setSelectionOnly(false)} />
-          <T>Whole file</T>
-        </label>
-        <label className={clsx(styles.reformatOption, !popup.hasSelection && styles.disabled)}>
-          <input
-            type="radio"
+      <div className={fieldsetStyles.body}>
+        <fieldset className={fieldsetStyles.group}>
+          <legend className={fieldsetStyles.legend}>
+            <T>Scope</T>
+          </legend>
+          <Radio
             name="reformat-scope"
             checked={selectionOnly}
             disabled={!popup.hasSelection}
             onChange={() => setSelectionOnly(true)}
+            label="Selected text"
           />
-          <T>Selected text</T>
-        </label>
-      </fieldset>
-      <fieldset className={styles.reformatGroup}>
-        <legend className={styles.reformatLegend}>
-          <T>Options</T>
-        </legend>
-        <Checkbox
-          checked={optimizeImports}
-          disabled={!popup.canOptimizeImports}
-          onChange={setOptimizeImports}
-          label="Optimize imports"
-        />
-      </fieldset>
+          <Radio
+            name="reformat-scope"
+            checked={!selectionOnly}
+            onChange={() => setSelectionOnly(false)}
+            label="Whole file"
+          />
+        </fieldset>
+        <fieldset className={fieldsetStyles.group}>
+          <legend className={fieldsetStyles.legend}>
+            <T>Options</T>
+          </legend>
+          <Checkbox
+            checked={optimizeImports}
+            disabled={!popup.canOptimizeImports}
+            onChange={setOptimizeImports}
+            label="Optimize imports"
+          />
+        </fieldset>
+      </div>
+    </Dialog>
+  );
+}
+
+function ImportsOnPasteDialog({ popup }: { popup: Extract<LspPopup, { kind: "importsOnPaste" }> }) {
+  const [selected, setSelected] = useState(() => popup.imports.map((_item, i) => i));
+  return (
+    <Dialog
+      open
+      title={tx("Add Imports on Paste")}
+      onClose={closePopup}
+      width={460}
+      buttons={[
+        {
+          label: "Add Imports",
+          role: "default",
+          disabled: !selected.length,
+          onClick: () => void executeAction("code.applyPastedImports", selected),
+        },
+        { label: "Cancel", role: "cancel" },
+      ]}
+    >
+      <div className={styles.pasteImports}>
+        <div>
+          <T>Select imports to add to the pasted code:</T>
+        </div>
+        <div className={styles.pasteImportList}>
+          {popup.imports.map((label, i) => (
+            <Checkbox
+              key={i}
+              label={label}
+              checked={selected.includes(i)}
+              onChange={(checked) =>
+                setSelected((current) => (checked ? [...current, i] : current.filter((n) => n !== i)))
+              }
+            />
+          ))}
+        </div>
+      </div>
     </Dialog>
   );
 }
@@ -672,10 +788,14 @@ export function LspPopups() {
   const seq = useLspPopup((s) => s.seq);
   if (!popup) return null;
   switch (popup.kind) {
+    case "importsOnPaste":
+      return <ImportsOnPasteDialog key={seq} popup={popup} />;
     case "list":
       return <ListPopup key={seq} popup={popup} />;
     case "rename":
       return <RenamePopup key={seq} popup={popup} />;
+    case "symbolRename":
+      return <SymbolRenameDialog key={seq} popup={popup} />;
     case "doc":
       return <DocPopup key={seq} popup={popup} />;
     case "definition":

@@ -36,9 +36,11 @@ import {
   withCustomOverrides,
   type KeymapDraft,
 } from "../keymap/model";
-import { buildKeymapTree } from "../keymap/KeymapPage";
+import { buildKeymapTree, keymapJson, keymapSearchLabels } from "../keymap/KeymapPage";
 import { groupPath } from "../keymap/groups";
+import { registerEditorActions } from "@/editor/core/actions";
 import { registerLspActions } from "@/editor/lsp/actions";
+import { matchActions } from "@/features/search/everywhere/model";
 import { _resetI18nForTests, setLocale } from "@/platform/i18n";
 
 it("finds the translated declaration action by 声明 and its English title", async () => {
@@ -55,6 +57,32 @@ it("finds the translated declaration action by 声明 and its English title", as
     dispose();
     _resetI18nForTests();
   }
+});
+
+describe("keymapJson", () => {
+  it("exports the keymap's name, base preset and every bound action", () => {
+    registerEditorActions();
+    const out = JSON.parse(
+      keymapJson("My Keymap", "intellij-macos", allActions(), { preset: "intellij-macos", overrides: {} }),
+    );
+    expect(out.name).toBe("My Keymap");
+    expect(out.basedOn).toBe("intellij-macos");
+    expect(out.actions["code.duplicateLine"]).toEqual(["Meta+D"]);
+    expect(out.actions["navigate.gotoLine"]).toEqual(["Meta+L"]);
+    // Unbound actions are omitted, not exported as empty lists.
+    expect(Object.values(out.actions).every((keys) => Array.isArray(keys) && keys.length > 0)).toBe(true);
+  });
+
+  it("exports overrides over the preset", () => {
+    registerEditorActions();
+    const out = JSON.parse(
+      keymapJson("Custom", "intellij-macos", allActions(), {
+        preset: "intellij-macos",
+        overrides: { "code.duplicateLine": ["Ctrl+T"] },
+      }),
+    );
+    expect(out.actions["code.duplicateLine"]).toEqual(["Ctrl+T"]);
+  });
 });
 
 const key = (
@@ -204,6 +232,30 @@ describe("conflicts", () => {
 });
 
 describe("shortcut search", () => {
+  it.each(Object.keys(PRESETS))("keeps mouse-only selection actions configurable in %s", (preset) => {
+    const dispose = registerEditorActions();
+    const originalKeymap = useKeymap.getState();
+    try {
+      for (const [id, title] of [
+        ["editor.addOrRemoveCaret", "Add or Remove Caret"],
+        ["editor.createRectangularSelectionOnMouseDrag", "Create Rectangular Selection on Mouse Drag"],
+      ] as const) {
+        expect(matchActions(allActions(), title, { isEnabled: () => true, recent: [id] })).toEqual([]);
+        const variants: KeymapDraft["overrides"][] = [{}, { [id]: ["Alt+Button1"] }, { [id]: [] }];
+        for (const overrides of variants) {
+          useKeymap.setState({ preset, overrides });
+          expect(keymapSearchLabels()).toContain(title);
+          const tree = buildKeymapTree(allActions(), { preset, overrides }, title, "");
+          const group = tree.find((node) => node.key === "grp:Editor Actions");
+          expect(group?.kind === "group" && group.children.map((node) => node.key)).toEqual([id]);
+        }
+      }
+    } finally {
+      useKeymap.setState(originalKeymap);
+      dispose();
+    }
+  });
+
   it("matches exact bindings and chord first strokes", () => {
     expect(bindingMatches(["Meta+K Meta+C"], "Meta+K")).toBe(true);
     expect(bindingMatches(["Shift+Meta+O"], "Meta+Shift+O")).toBe(true);
@@ -218,6 +270,11 @@ describe("shortcut search", () => {
       { id: "internal.x", title: "Internal", hidden: true, run },
     ];
     const draft = { preset: "intellij-macos", overrides: {} };
+    // Hidden from Search Everywhere but keymap-listed (Cut / Copy / Paste) still shows.
+    const copy = { id: "edit.copy", title: "Copy", category: "Edit", hidden: true, keymap: true, run };
+    const withCopy = buildKeymapTree([...actions, copy], draft, "copy", "");
+    const edit = withCopy[0]!.kind === "group" ? withCopy[0]!.children[0] : undefined;
+    expect(edit?.kind === "group" && edit.children.map((n) => n.key)).toEqual(["edit.copy"]);
     const all = buildKeymapTree(actions, draft, "", "");
     expect(all.map((n) => n.key)).toEqual(["grp:Main Menu"]);
     const menu = all[0]!.kind === "group" ? all[0]!.children : [];

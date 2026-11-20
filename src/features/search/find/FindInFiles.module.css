@@ -1,5 +1,6 @@
 /* IDEA's Find in Files is a popup: Popup.background, not the dialog surface. */
 .dialog {
+  container-type: inline-size;
   max-height: calc(90vh - 12px);
   background: var(--bg-popup, var(--bg-elev));
   font-family: var(--font-ui);
@@ -25,14 +26,23 @@
   border-bottom: 1px solid var(--border-popup);
   color: var(--fg-subtle);
 }
+/* Title and count give way to the controls: they end in an ellipsis instead of wrapping. */
+.title,
+.count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .title {
   color: var(--fg-strong);
   font-weight: 600;
 }
 .status {
+  min-width: 0;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
   color: var(--fg-faint);
   font-size: var(--fs-small);
   font-variant-numeric: tabular-nums;
@@ -40,7 +50,16 @@
 .spacer {
   flex: 1;
 }
+/* The mask and the buttons; their own row once the popup is too narrow for one (as in Search Everywhere). */
+.tools {
+  display: contents;
+}
+.maskToggle {
+  flex: none;
+  white-space: nowrap;
+}
 .mask {
+  min-width: 0;
   display: flex;
   align-items: center;
   height: var(--h-control);
@@ -54,6 +73,7 @@
 }
 .maskInput {
   width: 120px;
+  min-width: 0;
   background: none;
   border: 0;
   outline: none;
@@ -63,7 +83,7 @@
   flex: none;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
   padding: 8px 8px 0;
 }
 /* The query fields sit on the popup surface, framed only by their border. */
@@ -86,17 +106,21 @@
   --border-tab-selected: transparent;
   flex: none;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-1) var(--space-3);
   padding: 8px 14px 4px 20px;
 }
 .scopeDetail {
-  flex: 1;
+  flex: 1 1 200px;
   min-width: 0;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 4px;
+  gap: var(--space-1);
+}
+.scopeDetail:empty {
+  display: none;
 }
 .dirInput {
   width: 100%;
@@ -197,7 +221,7 @@
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--space-2);
   min-height: 46px;
   padding: 8px 20px;
 }
@@ -226,7 +250,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-0-5);
   padding: 0 20px;
   text-align: center;
   line-height: 1.6;
@@ -253,4 +277,26 @@
   flex: none;
   color: var(--fg-faint);
   white-space: nowrap;
+}
+
+/* Narrower than the popup's own minimum width happens only when the window is smaller. */
+@container (max-width: 559px) {
+  .header {
+    flex-wrap: wrap;
+    row-gap: var(--space-1-5);
+    height: auto;
+    padding-block: 6px;
+  }
+  .spacer {
+    display: none;
+  }
+  .tools {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+  }
+  .mask {
+    margin-right: auto;
+  }
 }

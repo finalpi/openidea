@@ -1,6 +1,8 @@
 use ide_core::CancellationToken;
 use ide_core::error::ErrorKind;
-use ide_search::{FileMatches, LineMatch, SearchQuery, SearchScope, SearchSummary, replace_in_text, search};
+use ide_search::{
+    FileMatches, LineMatch, SearchQuery, SearchScope, SearchSummary, TextSource, replace_in_text, search,
+};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
@@ -28,6 +30,7 @@ fn query(pattern: &str) -> SearchQuery {
         scope: SearchScope::Project,
         max_matches: 0,
         context: Default::default(),
+        include_excluded: false,
     }
 }
 
@@ -310,6 +313,25 @@ fn match_limit() {
     let (_, summary) = run(p.path(), &SearchQuery { max_matches: 14, ..query("x") });
     assert!(summary.limit_hit);
     assert_eq!(summary.matches, 14);
+}
+
+#[test]
+fn match_limit_across_parallel_files() {
+    // One file per folder, so several walker threads search at once.
+    let content = "x\n".repeat(50);
+    let names: Vec<String> = (0..16).map(|i| format!("m{i}/a.txt")).collect();
+    let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), content.as_bytes())).collect();
+    let p = project(&files);
+    for _ in 0..20 {
+        let (views, summary) = run(p.path(), &SearchQuery { max_matches: 800, ..query("x") });
+        assert!(!summary.limit_hit);
+        assert_eq!((total(&views), summary.matches, summary.files), (800, 800, 16));
+
+        let (views, summary) = run(p.path(), &SearchQuery { max_matches: 799, ..query("x") });
+        assert!(summary.limit_hit);
+        assert_eq!((total(&views), summary.matches), (799, 799));
+        assert_eq!(summary.files as usize, views.len());
+    }
 }
 
 #[test]
@@ -652,9 +674,15 @@ type Row = (String, u32, Vec<(u32, u32)>);
 fn run_context(root: &Path, context: ide_search::SearchContext) -> Vec<Row> {
     let out = Mutex::new(Vec::new());
     let q = SearchQuery { context, ..query("foo") };
-    ide_search::search_in_context(root, &q, None, Some(&toy_literals), &|_| None, &CancellationToken::new(), &|f| {
-        out.lock().unwrap().push(f)
-    })
+    ide_search::search_in_context(
+        root,
+        &q,
+        None,
+        Some(&toy_literals),
+        TextSource::detected(&|_| None),
+        &CancellationToken::new(),
+        &|f| out.lock().unwrap().push(f),
+    )
     .unwrap();
     let mut rows: Vec<_> = out
         .into_inner()
@@ -723,4 +751,133 @@ fn a_project_inside_a_repository_keeps_the_repositorys_gitignore() {
     std::fs::create_dir(p.path().join(".git")).unwrap();
     let (views, _) = run(&p.path().join("app"), &query("hit"));
     assert_eq!(paths(&views), ["src/a.txt"]);
+}
+
+fn gbk(text: &str) -> Vec<u8> {
+    encoding_rs::GBK.encode(text).0.into_owned()
+}
+
+fn utf16(text: &str, le: bool) -> Vec<u8> {
+    let units = text.encode_utf16();
+    if le {
+        [0xFF, 0xFE].into_iter().chain(units.flat_map(u16::to_le_bytes)).collect()
+    } else {
+        [0xFE, 0xFF].into_iter().chain(units.flat_map(u16::to_be_bytes)).collect()
+    }
+}
+
+#[test]
+fn non_utf8_files_are_searched_as_text() {
+    let java = gbk("class A {\n    //中文搜索验证 Chinese Chinese Chinese\n    log.info(\"新增档案开始\");\n}\n");
+    // Only bytes past the first read buffer are not UTF-8.
+    let late = [b"x\n".repeat(200_000), gbk("新增档案开始\n")].concat();
+    let p = project(&[
+        ("src/A.java", &java),
+        ("src/late.log", &late),
+        ("le.txt", &utf16("a\n新增档案开始\n", true)),
+        ("be.txt", &utf16("新增档案开始\n", false)),
+        ("utf8.txt", "新增档案开始\n".as_bytes()),
+        ("bin.dat", &[gbk("新增档案开始").as_slice(), &[0, 0, 1, 2]].concat()),
+    ]);
+
+    let (views, summary) = run(p.path(), &query("新增档案开始"));
+    assert_eq!(paths(&views), ["be.txt", "le.txt", "src/A.java", "src/late.log", "utf8.txt"]);
+    assert_eq!(summary.matches, 5);
+    let line = |path: &str| views.iter().find(|v| v.rel_path == path).unwrap().matches[0].clone();
+    assert_eq!((line("le.txt").line, line("le.txt").ranges), (1, vec![(0, 6)]));
+    assert_eq!((line("src/late.log").line, line("src/late.log").text), (200_000, "新增档案开始".to_owned()));
+    assert_eq!(line("src/A.java").text, "    log.info(\"新增档案开始\");");
+
+    // ASCII matches in a GBK file show its other characters decoded.
+    let (views, _) = run(p.path(), &query("Chinese"));
+    assert_eq!(paths(&views), ["src/A.java"]);
+    assert_eq!(views[0].matches[0].text, "    //中文搜索验证 Chinese Chinese Chinese");
+    assert_eq!(views[0].matches[0].ranges, [(13, 20), (21, 28), (29, 36)]);
+}
+
+#[test]
+fn dropped_matches_give_back_their_budget() {
+    // Matches claimed before a late NUL (binary) or late GBK bytes (searched again as text).
+    let head = b"needle\n".repeat(100);
+    let filler = b"a".repeat(200_000);
+    let binary = [head.as_slice(), &filler, b"\0\n"].concat();
+    let late_gbk = [head.as_slice(), &filler, b"\n", &gbk("中文\n")].concat();
+    // One project each: a thread's searcher keeps its grown buffer for the next file.
+    for (file, bytes, found) in [("bin.dat", binary, 0), ("late.txt", late_gbk, 100)] {
+        let p = project(&[(file, &bytes)]);
+        let (views, summary) = run(p.path(), &query("needle"));
+        assert_eq!((total(&views), summary.matches), (found, found as u32), "{file}");
+        assert!(!summary.limit_hit);
+    }
+}
+
+#[test]
+fn non_utf8_files_past_the_limit_show_decoded_text() {
+    let p = project(&[("a.txt", &gbk(&"x 中文\n".repeat(200)))]);
+    let (views, summary) = run(p.path(), &SearchQuery { max_matches: 100, ..query("x") });
+    assert!(summary.limit_hit);
+    assert_eq!((total(&views), summary.matches), (100, 100));
+    assert!(views[0].matches.iter().all(|m| m.text == "x 中文"));
+}
+
+#[test]
+fn non_utf8_files_use_the_given_decoder() {
+    // Text too short to detect reliably decodes with the configured encoding.
+    let p = project(&[("a.txt", &gbk("中文\n"))]);
+    let out = Mutex::new(Vec::new());
+    let decode = |_: &Path, bytes: &[u8]| ide_vfs::decode_text(bytes, Some("gbk"));
+    let source = TextSource { overlay: &|_| None, decode: &decode };
+    ide_search::search_in_context(p.path(), &query("中文"), None, None, source, &CancellationToken::new(), &|f| {
+        out.lock().unwrap().push(f)
+    })
+    .unwrap();
+    let files = out.into_inner().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].matches[0].text, "中文");
+}
+
+#[test]
+fn search_context_reads_non_utf8_files() {
+    use ide_search::SearchContext as C;
+    let p = project(&[("a.rs", &gbk("foo(\"新增\"); // 中文 foo\n"))]);
+    assert_eq!(run_context(p.path(), C::InComments), vec![("a.rs".to_owned(), 0, vec![(17, 20)])]);
+}
+
+#[test]
+fn subtree_masks_preserve_results_across_search_scopes() {
+    let p = project(&[
+        ("edge/build/deep/generated.go", b"hit"),
+        ("edge/src/main.go", b"hit"),
+        ("internal/build/build.go", b"hit"),
+        ("edge/build-notes.go", b"hit"),
+    ]);
+    let q = SearchQuery { exclude: vec!["edge/build/**".into()], ..query("hit") };
+    let (views, _) = run(p.path(), &q);
+    assert_eq!(paths(&views), ["edge/build-notes.go", "edge/src/main.go", "internal/build/build.go"]);
+    let mask = ide_search::FileMask::new(&q.include, &q.exclude).unwrap();
+    for scope in [
+        SearchScope::Directory { path: "edge/build".into() },
+        SearchScope::Files { paths: vec!["edge/build/deep/generated.go".into()] },
+    ] {
+        let (views, _) = run(p.path(), &SearchQuery { scope: scope.clone(), ..q.clone() });
+        assert!(views.is_empty());
+        assert!(ide_search::scope_files(p.path(), &scope, &mask, None, &CancellationToken::new()).unwrap().is_empty());
+    }
+    // A file-name exclusion must not prune a same-named directory.
+    let (views, _) = run(p.path(), &SearchQuery { exclude: vec!["build".into()], ..query("hit") });
+    assert_eq!(views.len(), 4);
+}
+
+#[test]
+fn ignore_whitelists_do_not_override_explicit_subtree_masks() {
+    let p = project(&[
+        (".gitignore", b"generated/*\n!generated/keep/\n"),
+        ("generated/keep/.gitignore", b"!keep.go\n"),
+        ("generated/keep/keep.go", b"needle"),
+        ("src/main.go", b"needle"),
+    ]);
+    let (views, _) = run(p.path(), &query("needle"));
+    assert_eq!(paths(&views), ["generated/keep/keep.go", "src/main.go"]);
+    let (views, _) = run(p.path(), &SearchQuery { exclude: vec!["generated/**".into()], ..query("needle") });
+    assert_eq!(paths(&views), ["src/main.go"]);
 }

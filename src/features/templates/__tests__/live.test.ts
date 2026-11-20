@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { snippet } from "@codemirror/autocomplete";
 import { languages } from "@codemirror/language-data";
-import { ensureSyntaxTree } from "@codemirror/language";
+import { completedSyntaxState } from "@/test/syntax";
 import {
   applicableTemplates,
   bodyVariables,
@@ -26,8 +26,7 @@ function apply(doc: string, tpl: string, from: number, to = from) {
 async function stateFor(lang: string, doc: string) {
   const desc = languages.find((l) => l.name === lang)!;
   const support = await desc.load();
-  const state = EditorState.create({ doc, extensions: [support] });
-  ensureSyntaxTree(state, state.doc.length, 5000);
+  const state = completedSyntaxState(EditorState.create({ doc, extensions: [support] }));
   return state;
 }
 
@@ -151,6 +150,7 @@ describe("expansion", () => {
       expect(has("typescriptreact", a)).toBe(true);
     for (const a of ["main", "def", "class", "ifmain", "with", "try"]) expect(has("python", a)).toBe(true);
     for (const a of ["iferr", "fori", "func", "test"]) expect(has("go", a)).toBe(true);
+    for (const a of ["pfn", "test", "st", "iferr", "defer", "for"]) expect(has("zig", a)).toBe(true);
     for (const a of ["psvm", "sout", "fori", "iter", "main"]) expect(has("java", a)).toBe(true);
     for (const a of ["main", "fun", "val", "sout"]) expect(has("kotlin", a)).toBe(true);
     for (const a of ["todo", "fixme"]) expect(has("go", a)).toBe(true);

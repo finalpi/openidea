@@ -10,8 +10,8 @@ export interface TestLocation {
   /** 1-based, as printed. */
   line?: number;
   col?: number;
-  /** `name`: a file name to look up in the project (JVM / Go frames). */
-  resolve: "path" | "name";
+  /** `name`: a file name to look up in the project (JVM / Go frames); `rubyTest`: a test to search for (`rubyTests.ts`). */
+  resolve: "path" | "name" | "rubyTest";
   /** JVM frames: the class's binary name; `path` is then the file under its package directory. */
   className?: string;
 }
@@ -41,6 +41,15 @@ export function parseDuration(text: string | undefined): number | undefined {
     total += m[2] === "ms" ? v : m[2] === "m" || m[2] === "min" ? v * 60_000 : v * 1000;
   }
   return matched ? Math.round(total * 1000) / 1000 : undefined;
+}
+
+/** Formats a duration the way the test tree shows it: `850 ms`, `1.25 s`, `2 m 5 s`. */
+export function formatDuration(ms: number | undefined): string {
+  if (ms === undefined) return "";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1).replace(/\.?0+$/, "")} s`;
+  const m = Math.floor(ms / 60_000);
+  return `${m} m ${Math.round((ms % 60_000) / 1000)} s`;
 }
 
 /**

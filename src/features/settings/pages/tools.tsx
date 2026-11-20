@@ -7,6 +7,7 @@
 import { FontPicker } from "../components/FontPicker";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import clsx from "clsx";
+import { quotePath } from "@/platform/commandLine";
 import { commands, isTauri } from "@/platform/ipc";
 import {
   DEFAULT_EXTERNAL_TOOL,
@@ -15,15 +16,45 @@ import {
   type ExternalToolValid,
 } from "@/platform/workflowSettings";
 import { Button, Checkbox, IconButton, Input, Menu, type SelectOption, T } from "@/ui";
-import { NumberInput, Row, SearchLabel, Section, Select } from "../components/Form";
+import { NumberInput, Row, SearchLabel, Section, Select, SettingSelect } from "../components/Form";
 import { useLabelMatch, useSetting } from "../components/context";
 import { selectPage, setQuery } from "../model/staging";
+import { MirrorPrefixRow } from "./DownloadSources";
+import { MCP_SERVER_PAGE } from "./mcpServer";
 import type { PageSpec } from "./spec";
 import { BoundToggle, Grid, Indented, PageLink, TableEditor } from "./workflowControls";
 import styles from "./Workflow.module.css";
 import { tx } from "@/platform/i18n";
+import { TERMINAL_MAX_FPS_OPTIONS } from "@/platform/workflowSettings";
 
 export const TOOLS_GROUP = "Tools";
+
+const SEND_KEY_OPTIONS = [
+  { value: "enter", label: "Enter" },
+  { value: "modEnter", label: "⌘Enter" },
+];
+const APP_TITLE_OPTIONS = [
+  { value: "running", label: "When command is running" },
+  { value: "always", label: "Always" },
+  { value: "off", label: "Never" },
+];
+const WHILE_RUNNING_OPTIONS = [
+  { value: "queue", label: "Queues the message for after the turn" },
+  { value: "steer", label: "Sends it into the turn" },
+];
+const NEW_TASK_APPROVAL_OPTIONS = [
+  { value: "bypass", label: "Without asking for approval" },
+  { value: "ask", label: "Asking for approval" },
+];
+const TOOL_CALL_OPTIONS = [
+  { value: "grouped", label: "Grouped by what they did" },
+  { value: "each", label: "One per line" },
+];
+const THINKING_OPTIONS = [
+  { value: "auto", label: "Open while it streams" },
+  { value: "expanded", label: "Always open" },
+  { value: "collapsed", label: "Folded" },
+];
 
 const L = WORKFLOW_LIMITS;
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent);
@@ -107,10 +138,10 @@ function ShellPathRow() {
     void commands.termAvailableShells().then(setShells, () => undefined);
   }, []);
   const browse = async () => {
-    const { open: pick } = await import("@tauri-apps/plugin-dialog");
+    const { open: pick } = await import("@/platform/dialog");
     const picked = await pick({ multiple: false, title: "Shell Path" });
     const path = Array.isArray(picked) ? picked[0] : picked;
-    if (path) set(path);
+    if (path) set(quotePath(path));
   };
   return (
     <Row
@@ -142,7 +173,7 @@ function ShellPathRow() {
         anchor={menuRef}
         placement="bottom-end"
         aria-label="Installed shells"
-        items={shells.map((p) => ({ id: p, label: p, checked: p === value, run: () => set(p) }))}
+        items={shells.map((p) => ({ id: p, label: p, checked: quotePath(p) === value, run: () => set(quotePath(p)) }))}
       />
       <IconButton
         icon="folder-open"
@@ -218,7 +249,14 @@ function TerminalOptions() {
           />
           <BoundToggle k="terminal.shellIntegration" label="Shell integration" />
           <BoundToggle k="terminal.highlightHyperlinks" label="Highlight hyperlinks" />
+          <BoundToggle k="terminal.highlightSelection" label="Highlight occurrences of selected text" />
           {isMac && <BoundToggle k="terminal.optionAsMeta" label="Use Option as Meta key" />}
+          <SettingSelect
+            k="terminal.maxFps"
+            label="Maximum refresh rate"
+            hint="Caps how often fast terminal output is painted. Hidden windows always paint more slowly."
+            options={TERMINAL_MAX_FPS_OPTIONS}
+          />
         </>
       }
     />
@@ -234,7 +272,8 @@ function TerminalFont() {
   const [columnWidth, setColumnWidth] = useSetting<number>("terminal.columnWidth");
   const matched = useLabelMatch("Use editor font");
   const monoMatched = useLabelMatch("Show only monospaced fonts");
-  const [monoOnly, setMonoOnly] = useState(true);
+  const [monoSetting, setMonoOnly] = useSetting<boolean>("editor.onlyMonospacedFonts");
+  const monoOnly = monoSetting !== false;
   return (
     <>
       <div className={clsx(styles.inlineRow, matched && styles.matched)}>
@@ -479,8 +518,12 @@ function ExternalToolsEditor() {
                 checked={t.enabled}
                 onChange={(on) => setTools(tools.map((x) => (x.id === t.id ? { ...x, enabled: on } : x)))}
               />
-              <span>{t.name}</span>
-              <span className={styles.toolGroup}>{t.group}</span>
+              <span className={styles.toolName} title={t.name}>
+                {t.name}
+              </span>
+              <span className={styles.toolGroup} title={t.group}>
+                {t.group}
+              </span>
             </div>
           ))}
         </div>
@@ -564,6 +607,12 @@ export const TOOLS_PAGES: PageSpec[] = [
           { kind: "custom", label: "Shell path", component: ShellPathRow },
           { kind: "text", key: "terminal.tabName", label: "Default Tab name", placeholder: "Local" },
           {
+            kind: "select",
+            key: "terminal.appTitleAsTabName",
+            label: "Use application title as tab name",
+            options: APP_TITLE_OPTIONS,
+          },
+          {
             kind: "custom",
             label: "Audible bell",
             keywords: [
@@ -577,6 +626,7 @@ export const TOOLS_PAGES: PageSpec[] = [
               "Use Option as Meta key",
               "Move focus to the Editor with Escape",
               "Configure terminal keybindings",
+              "Maximum refresh rate",
             ],
             component: TerminalOptions,
           },
@@ -624,13 +674,115 @@ export const TOOLS_PAGES: PageSpec[] = [
     ],
   },
   {
-    // Under Settings › Tools › Agents (the agents feature registers `tools.agents`).
-    id: "tools.agents.chat",
-    title: "Chat",
+    id: "tools.externalDiff",
+    title: "External Diff Tools",
     group: TOOLS_GROUP,
-    order: 0,
-    keywords: ["agent", "claude", "codex", "usage", "quota", "rate limit", "cost", "tokens", "meter"],
+    order: 605,
+    keywords: ["diff", "compare", "Beyond Compare", "meld", "kdiff3", "opendiff", "FileMerge"],
     sections: [
+      {
+        options: [
+          {
+            kind: "toggle",
+            key: "externalDiff.enabled",
+            label: "Use external diff tool",
+            hint: "Diff viewers offer Show Diff in External Tool.",
+          },
+          { kind: "text", key: "externalDiff.path", label: "Path to executable", placeholder: "/usr/local/bin/bcomp" },
+          {
+            kind: "text",
+            key: "externalDiff.parameters",
+            label: "Parameters",
+            placeholder: "%1 %2 %3",
+            hint: "%1 – the left file, %2 – the right file, %3 – the diff's title.",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "agents.chat",
+    title: "Chat",
+    group: "Agents",
+    order: 460,
+    keywords: [
+      "agent",
+      "claude",
+      "codex",
+      "usage",
+      "quota",
+      "rate limit",
+      "cost",
+      "tokens",
+      "meter",
+      "send",
+      "reasoning",
+      "approval",
+      "permission",
+      "bypass",
+      "width",
+    ],
+    sections: [
+      {
+        title: "New Tasks",
+        options: [
+          {
+            kind: "select",
+            key: "agents.newTaskApprovals",
+            label: "New tasks start",
+            options: NEW_TASK_APPROVAL_OPTIONS,
+            hint: "Without asking means the agent's bypass or full-access mode, where command permissions don't apply",
+          },
+        ],
+      },
+      {
+        title: "Sending",
+        options: [
+          { kind: "select", key: "agents.sendWith", label: "Send messages with", options: SEND_KEY_OPTIONS },
+          {
+            kind: "select",
+            key: "agents.whileRunning",
+            label: "While the agent works, sending",
+            options: WHILE_RUNNING_OPTIONS,
+            hint: "The other way is a modifier away: ⌘↵ with Enter, ⌘⇧↵ with ⌘↵",
+          },
+        ],
+      },
+      {
+        title: "Conversation",
+        options: [
+          {
+            kind: "toggle",
+            key: "agents.foldTurns",
+            label: "Fold a finished turn's work",
+            hint: "Reasoning and tool calls before the reply fold into one line under its message",
+          },
+          {
+            kind: "select",
+            key: "agents.toolCalls",
+            label: "Tool calls",
+            options: TOOL_CALL_OPTIONS,
+          },
+          {
+            kind: "select",
+            key: "agents.thinking",
+            label: "Reasoning",
+            options: THINKING_OPTIONS,
+          },
+          { kind: "toggle", key: "agents.expandToolOutput", label: "Show tool output without opening it" },
+          {
+            kind: "toggle",
+            key: "agents.smoothText",
+            label: "Reveal streaming text smoothly",
+            hint: "Text appears at a steady pace instead of in bursts",
+          },
+          {
+            kind: "toggle",
+            key: "agents.fitWindowWidth",
+            label: "Fit conversation to the window width",
+          },
+        ],
+      },
       {
         title: "Shown in the Task Header",
         options: [
@@ -672,6 +824,27 @@ export const TOOLS_PAGES: PageSpec[] = [
               "Synchronize files after execution",
             ],
             component: ExternalToolsEditor,
+          },
+        ],
+      },
+    ],
+  },
+  MCP_SERVER_PAGE,
+  {
+    id: "tools.downloadSources",
+    title: "Download Mirrors",
+    group: TOOLS_GROUP,
+    order: 590,
+    keywords: ["mirror", "download", "github", "proxy", "slow", "language server", "accelerate"],
+    sections: [
+      {
+        title: "GitHub",
+        options: [
+          {
+            kind: "custom",
+            label: "Mirror prefix for GitHub downloads",
+            keywords: ["https://gh-proxy.com/", "info"],
+            component: MirrorPrefixRow,
           },
         ],
       },

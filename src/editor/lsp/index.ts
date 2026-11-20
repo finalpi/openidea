@@ -1,3 +1,4 @@
+import { serverCodeLenses } from "./serverCodeLens";
 /**
  * LSP-backed editor features: completion, diagnostics, hover / quick docs,
  * parameter info, navigation, document highlights, intentions, rename,
@@ -21,12 +22,14 @@ import { diagnosticsExtension, installDiagnosticsEvents } from "./diagnostics";
 import { hoverExtension } from "./hover";
 import { parameterTabKeys, signatureExtension } from "./signature";
 import { navigationExtension } from "./navigation";
-import { intentionsExtension } from "./intentions";
+import { intentionsExtension, registerClientCommand } from "./intentions";
 import { inlayExtension } from "./inlay";
 import { inlineCompletionExtension, registerInlineCompletionActions } from "./inlineCompletion";
 import { semanticExtension } from "./semantic";
 import { usagesLensExtension } from "./codeLens";
 import { autoImportExtension } from "./autoImport";
+import { importsOnPasteExtension, registerImportsOnPasteActions } from "./importsOnPaste";
+import { installConfigurationNavigationEvents } from "./configurationNavigation";
 import { installAvailabilityEvents } from "./availability";
 import { registerActionsOnSave, registerFormatOnSave, registerLspActions } from "./actions";
 import { lspTheme } from "./theme";
@@ -39,11 +42,18 @@ import { DOCUMENTATION_WINDOW } from "./docs";
 import { prefetchMarkdown } from "./markdown";
 import { outsideProjectBanner } from "./outsideProject";
 import { implementationGutter, registerNavigationActions } from "@/editor/navigation";
-import { HierarchyDialog } from "@/editor/refactor";
+import {
+  ChangeSignatureDialog,
+  ExtractInterfaceDialog,
+  HierarchyDialog,
+  JAVA_REFACTORING_COMMAND,
+  runJavaRefactoringCommand,
+} from "@/editor/refactor";
 
 export function lspExtensions(ctx: EditorDocContext): Extension[] {
   return [
     lspDoc.of(ctx),
+    serverCodeLenses(ctx),
     lspTheme,
     hintExtension(),
     diagnosticsExtension(),
@@ -59,23 +69,62 @@ export function lspExtensions(ctx: EditorDocContext): Extension[] {
     semanticExtension(),
     usagesLensExtension(),
     autoImportExtension(),
+    importsOnPasteExtension(),
     unresolvedReferences(),
     syntaxErrorsExtension(),
     spellingExtension(),
   ];
 }
 
+/**
+ * A notebook code cell: completion, hover / quick docs, parameter info, diagnostics, highlights
+ * and ⌘/Ctrl-click navigation. Features that edit other files or need an editor tab (rename,
+ * intentions, inlay hints, lenses) stay with text editors.
+ */
+export function cellLspExtensions(ctx: EditorDocContext): Extension[] {
+  return [
+    lspDoc.of(ctx),
+    lspTheme,
+    hintExtension(),
+    diagnosticsExtension(),
+    hoverExtension(),
+    signatureExtension(),
+    completionExtension(),
+    navigationExtension(),
+  ];
+}
+
+/**
+ * A diff pane showing a file's open document: hover / quick docs, ⌘/Ctrl-click
+ * navigation and semantic highlighting, so colours match the editor while
+ * reviewing. Editing features stay with text editors; panes without a document
+ * (revisions) get nothing from the semantic extension (`docOf` is null).
+ */
+export function diffLspExtensions(ctx: EditorDocContext): Extension[] {
+  return [lspDoc.of(ctx), lspTheme, hintExtension(), hoverExtension(), navigationExtension(), semanticExtension()];
+}
+
 export function activate(): () => void {
   const disposers = [
     installDiagnosticsEvents(),
     installAvailabilityEvents(),
-    registerEditorContribution({ id: "lsp", order: 50, extensions: lspExtensions }),
+    installConfigurationNavigationEvents(),
+    registerEditorContribution({
+      id: "lsp",
+      order: 50,
+      extensions: lspExtensions,
+      cellExtensions: cellLspExtensions,
+      diffExtensions: diffLspExtensions,
+    }),
     // After the run icons (order 55), as their own gutter column.
     registerEditorContribution({ id: "lsp.lineMarkers", order: 56, extensions: implementationGutter }),
     // After the templates (order 90): live template / postfix expansion keeps ⇥ first.
     registerEditorContribution({ id: "lsp.parameterTab", order: 95, extensions: () => parameterTabKeys }),
     registerOverlay({ id: "editor-lsp.popups", component: LspPopups }),
     registerOverlay({ id: "editor-lsp.hierarchyDialog", component: HierarchyDialog }),
+    registerOverlay({ id: "editor-lsp.changeSignatureDialog", component: ChangeSignatureDialog }),
+    registerOverlay({ id: "editor-lsp.extractInterfaceDialog", component: ExtractInterfaceDialog }),
+    registerClientCommand(JAVA_REFACTORING_COMMAND, runJavaRefactoringCommand),
     registerEditorBanner(outsideProjectBanner),
     registerStatusItem({ id: "editor-lsp.usagesStatus", align: "left", priority: 10, component: UsagesStatus }),
     // IDEA's Documentation tool window: right side, listed once F1 moved documentation there.
@@ -90,6 +139,7 @@ export function activate(): () => void {
       component: DocumentationWindow,
     }),
     registerLspActions(),
+    registerImportsOnPasteActions(),
     registerInlineCompletionActions(),
     registerNavigationActions(),
     registerFormatOnSave(),

@@ -4,15 +4,18 @@
  * overlay layer. Without an open project the welcome view replaces the frame,
  * or, editing loose files (LightEdit), a frame with the editor only.
  */
+import { useSyncExternalStore } from "react";
 import { useEditorRegistry } from "@/editor/api";
+import { Breadcrumbs } from "@/editor/core";
 import { basename, useProject } from "@/platform/project";
+import { isUntitledUri, untitledTitle } from "@/platform/virtualDocs";
 import { useT } from "@/platform/i18n";
 import { ProgressBar } from "@/ui";
 import projectMark from "../../src-tauri/icons/source/openidea-mark.svg";
 import { useDistractionFree } from "./distractionFree";
 import { EditorArea } from "./EditorArea";
 import { OverlayHost } from "./OverlayHost";
-import { projectColorVars } from "./projectColor";
+import { subscribeTabColors, tabColorOverride, tabColorVars, tabColorsVersion } from "./tabColors";
 import { StatusBar } from "./StatusBar";
 import { TitleBar } from "./TitleBar";
 import { WindowGroupTabs } from "./WindowGroupTabs";
@@ -23,19 +26,34 @@ import { WindowResizeHandles } from "./WindowResizeHandles";
 import { useContributions, useStandaloneEditor } from "./contributions";
 import styles from "./Workbench.module.css";
 
+/** View › Appearance switches (`appearance.showMainToolbar`, `appearance.showStatusBar`), shown by default. */
+function useAppearanceFlag(key: "showMainToolbar" | "showStatusBar"): boolean {
+  return useProject((s) => s.settings?.appearance?.[key] !== false);
+}
+
+/** Where View › Appearance › Navigation Bar puts the file path breadcrumbs. */
+type NavigationBarPosition = "top" | "statusBar" | "hidden";
+function useNavigationBarPosition(): NavigationBarPosition {
+  const position = useProject((s) => s.settings?.appearance?.navigationBar);
+  // Nothing loaded yet, or a malformed value: match the backend default (`statusBar`).
+  return position === "top" || position === "statusBar" || position === "hidden" ? position : "statusBar";
+}
+
 /** LightEdit: editor tabs only; no tool windows, toolbar widgets or project status items. */
 function LightEditFrame({ title }: { title?: string }) {
   const path = useEditorRegistry((s) => s.active?.ctx.path);
   const distractionFree = useDistractionFree((s) => s.active);
+  const statusBar = useAppearanceFlag("showStatusBar");
+  const name = path ? (isUntitledUri(path) ? untitledTitle(path) : basename(path)) : "LightEdit";
   return (
     <>
-      <TitleBar lightEdit bare={distractionFree} title={title ?? (path ? basename(path) : "LightEdit")} />
+      <TitleBar lightEdit compact={distractionFree} title={title ?? name} />
       <main className={styles.lightEdit} data-light-edit>
         <div className={styles.lightEditIsland}>
           <EditorArea />
         </div>
       </main>
-      {!distractionFree && <StatusBar lightEdit />}
+      {!distractionFree && statusBar && <StatusBar lightEdit />}
     </>
   );
 }
@@ -63,6 +81,7 @@ function ProjectOpening({ path }: { path: string }) {
 
 export function Workbench() {
   useApplyTheme();
+  useSyncExternalStore(subscribeTabColors, tabColorsVersion);
   const banners = useContributions((s) => s.workbenchBanners);
   const project = useProject((s) => s.project);
   const lightEdit = useProject((s) => s.lightEdit);
@@ -70,24 +89,27 @@ export function Workbench() {
   const openingPath = useProject((s) => s.openingPath);
   const root = project?.root ?? null;
   const distractionFree = useDistractionFree((s) => s.active);
+  const mainToolbar = useAppearanceFlag("showMainToolbar");
+  const statusBar = useAppearanceFlag("showStatusBar");
+  const navBarPosition = useNavigationBarPosition();
   const frame = project ? styles.framed : lightEdit || standaloneTitle ? styles.lightEditFrame : undefined;
 
   return (
     <div
       className={frame ? `${styles.workbench} ${frame}` : styles.workbench}
-      style={project ? projectColorVars(project.name) : undefined}
+      style={project ? tabColorVars(project.name, root ? tabColorOverride(root) : null) : undefined}
     >
       <div className={styles.content} inert={openingPath !== null} aria-hidden={openingPath ? true : undefined}>
         {project ? (
           <>
-            {/* Distraction Free Mode keeps the bar for the traffic lights and window dragging only. */}
-            <TitleBar bare={distractionFree} />
+            <TitleBar compact={distractionFree || !mainToolbar} />
+            {!distractionFree && navBarPosition === "top" && <Breadcrumbs className={styles.navigationBar} />}
             {!distractionFree && <WindowGroupTabs />}
             {[...banners.values()].map(({ id, component: Banner }) => (
               <Banner key={id} />
             ))}
             <ToolWindowLayout key={root} editor={<EditorArea />} />
-            {!distractionFree && <StatusBar />}
+            {!distractionFree && statusBar && <StatusBar />}
           </>
         ) : lightEdit || standaloneTitle ? (
           <LightEditFrame title={standaloneTitle ?? undefined} />

@@ -5,7 +5,8 @@ import { useState } from "react";
 import type { PluginInfo } from "@/bindings";
 import { SettingsFormContext, type SettingsForm } from "@/workbench/contributions";
 import { createMemoryPluginsBackend, setPluginsBackend } from "../backend";
-import { settingsPage, type SettingsDecl } from "../settingsPage";
+import type { SettingsDecl } from "../settings";
+import { settingsPage } from "../settingsPage";
 import { usePlugins } from "../store";
 
 const id = "test.ai";
@@ -37,6 +38,12 @@ function Form() {
     scope: "global",
     useValue: () => settings,
     set: (_key, value) => setSettings(value as typeof settings),
+    setMapEntry: () => {
+      throw new Error("not used");
+    },
+    apply: async () => {
+      throw new Error("diagnostics must not apply settings");
+    },
     useExternal: () => {
       throw new Error("not used");
     },

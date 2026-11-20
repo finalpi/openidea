@@ -16,26 +16,184 @@ pub struct PythonPackage {
     pub version: String,
 }
 
-/// Creates a virtualenv at `location` with `base -m venv` and returns its interpreter.
+/// The tool that creates a new Python environment in "Add Python Interpreter".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum VenvTool {
+    /// `base -m venv <location>`.
+    Venv,
+    /// `uv venv <location> --python <base>` (uv must be on PATH).
+    Uv,
+    /// `poetry env use <base>` in the project, then `poetry env info --path`.
+    Poetry,
+    /// `conda create -n <name> -y` for a bare name, else `-p <location>` (conda must be on PATH).
+    Conda,
+}
+
+/// Creates a virtualenv at `location` with `tool` and returns its interpreter.
+/// `base` is the interpreter uv / venv build on, or the one poetry's env uses.
 pub fn create_venv(
+    tool: VenvTool,
     base: &Path,
     location: &Path,
     cancel: &CancellationToken,
     on_line: &dyn Fn(String),
 ) -> IdeResult<Sdk> {
-    if location.join("pyvenv.cfg").is_file() {
+    create_venv_with(tool, base, location, which, cancel, on_line)
+}
+
+/// [`create_venv`] with the tool lookup injectable (tests fake `uv` / `poetry`).
+pub(crate) fn create_venv_with(
+    tool: VenvTool,
+    base: &Path,
+    location: &Path,
+    which: impl Fn(&str) -> Option<PathBuf>,
+    cancel: &CancellationToken,
+    on_line: &dyn Fn(String),
+) -> IdeResult<Sdk> {
+    match tool {
+        VenvTool::Venv | VenvTool::Uv => {
+            if location.join("pyvenv.cfg").is_file() {
+                return Err(IdeError::new(
+                    ide_core::error::ErrorKind::AlreadyExists,
+                    format!("{} already contains a virtual environment", location.display()),
+                ));
+            }
+            if let Some(parent) = location.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let (program, args) = match tool {
+                VenvTool::Uv => {
+                    let uv = which("uv").ok_or_else(|| {
+                        IdeError::unavailable("uv is not installed (install it from https://docs.astral.sh/uv)")
+                    })?;
+                    (
+                        uv,
+                        vec![
+                            "venv".to_owned(),
+                            location.to_string_lossy().into_owned(),
+                            "--python".to_owned(),
+                            base.to_string_lossy().into_owned(),
+                        ],
+                    )
+                }
+                _ => (base.to_path_buf(), venv_args(location)),
+            };
+            stream(&program, &args, None, &[], cancel, on_line)?;
+            let python = location.join(bin_dir()).join(exe("python"));
+            crate::discover::python_sdk(&python, "venv", location.parent().and_then(Path::parent))
+                .ok_or_else(|| IdeError::internal(format!("{} was not created", python.display())))
+        }
+        VenvTool::Poetry => create_poetry_env(base, location, &which, cancel, on_line),
+        VenvTool::Conda => create_conda_env(base, location, &which, cancel, on_line),
+    }
+}
+
+/// `poetry env use <base>` in the project directory (the parent of `location`, which the
+/// dialog fills with `<root>/.venv` only as a hint — poetry keeps its envs under its own
+/// cache), then `poetry env info --path` for the interpreter it made or reused.
+fn create_poetry_env(
+    base: &Path,
+    location: &Path,
+    which: &dyn Fn(&str) -> Option<PathBuf>,
+    cancel: &CancellationToken,
+    on_line: &dyn Fn(String),
+) -> IdeResult<Sdk> {
+    let poetry = which("poetry")
+        .ok_or_else(|| IdeError::unavailable("Poetry is not installed (install it from https://python-poetry.org)"))?;
+    let project = location
+        .parent()
+        .filter(|p| p.is_dir())
+        .ok_or_else(|| IdeError::invalid("Poetry environments need an open project directory"))?;
+    stream(
+        &poetry,
+        &["env".to_owned(), "use".to_owned(), base.to_string_lossy().into_owned()],
+        Some(project),
+        &[],
+        cancel,
+        on_line,
+    )?;
+    let home = query_in(&poetry, &["env", "info", "--path"], Some(project), &[], Duration::from_secs(30))
+        .map(PathBuf::from)
+        .ok_or_else(|| IdeError::internal("poetry created no environment".to_owned()))?;
+    let python = home.join(bin_dir()).join(exe("python"));
+    crate::discover::python_sdk(&python, "venv", Some(project))
+        .ok_or_else(|| IdeError::internal(format!("{} was not created", python.display())))
+}
+
+/// `conda create -n <name> -y` builds a named environment in conda's envs directory when
+/// `location` is a bare name, `conda create -p <location> -y` one at that prefix otherwise.
+/// `base` pins the Python version (`python=<major.minor>`) when it reports one, so the
+/// created env matches the interpreter the user picked rather than conda's default.
+fn create_conda_env(
+    base: &Path,
+    location: &Path,
+    which: &dyn Fn(&str) -> Option<PathBuf>,
+    cancel: &CancellationToken,
+    on_line: &dyn Fn(String),
+) -> IdeResult<Sdk> {
+    // A bare name is a named environment in conda's own envs directory (`conda create -n`).
+    let name = conda_env_name(location);
+    if name.is_none() && location.join("conda-meta").is_dir() {
         return Err(IdeError::new(
             ide_core::error::ErrorKind::AlreadyExists,
-            format!("{} already contains a virtual environment", location.display()),
+            format!("{} already contains a conda environment", location.display()),
         ));
     }
-    if let Some(parent) = location.parent() {
+    let conda = which("conda")
+        .ok_or_else(|| IdeError::unavailable("conda is not installed (install it from https://docs.conda.io)"))?;
+    let prefixes = || {
+        query_in(&conda, &["env", "list"], None, &[], Duration::from_secs(15))
+            .map(|list| crate::discover::conda_env_list_prefixes(&list))
+            .unwrap_or_default()
+    };
+    if let Some(name) = name {
+        if prefixes().iter().any(|p| p.file_name().is_some_and(|n| n == name)) {
+            return Err(IdeError::new(
+                ide_core::error::ErrorKind::AlreadyExists,
+                format!("A conda environment named {name} already exists"),
+            ));
+        }
+    } else if let Some(parent) = location.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    stream(base, &venv_args(location), None, &[], cancel, on_line)?;
-    let python = location.join(bin_dir()).join(exe("python"));
-    crate::discover::python_sdk(&python, "venv", location.parent().and_then(Path::parent))
+    let version = query_in(base, &["--version"], None, &[], Duration::from_secs(15))
+        .and_then(|v| v.strip_prefix("Python ").map(str::to_owned));
+    stream(&conda, &conda_create_args(location, version.as_deref()), None, &[], cancel, on_line)?;
+    let prefix = match name {
+        Some(name) => prefixes()
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n == name))
+            .ok_or_else(|| IdeError::internal(format!("conda did not report the environment {name}")))?,
+        None => location.to_path_buf(),
+    };
+    // Conda keeps `python.exe` at the prefix root on Windows, not under Scripts/.
+    let python = [prefix.join(exe("python")), prefix.join(bin_dir()).join(exe("python"))]
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| prefix.join(bin_dir()).join(exe("python")));
+    crate::discover::python_sdk(&python, "conda", prefix.parent().and_then(Path::parent))
         .ok_or_else(|| IdeError::internal(format!("{} was not created", python.display())))
+}
+
+/// The environment name when `location` is a bare name rather than a path.
+fn conda_env_name(location: &Path) -> Option<&str> {
+    let text = location.to_str()?;
+    (!text.is_empty() && !text.contains(['/', '\\', ':']) && text != "." && text != "..").then_some(text)
+}
+
+/// `conda create -n <name>` for a bare name, `-p <prefix>` for a path, with the base's `major.minor` Python.
+pub(crate) fn conda_create_args(location: &Path, version: Option<&str>) -> Vec<String> {
+    let mut args = match conda_env_name(location) {
+        Some(name) => vec!["create".to_owned(), "-n".to_owned(), name.to_owned()],
+        None => vec!["create".to_owned(), "-p".to_owned(), location.to_string_lossy().into_owned()],
+    };
+    args.push("-y".to_owned());
+    let short = version.map(|v| v.split('.').take(2).collect::<Vec<_>>().join(".")).unwrap_or_default();
+    if !short.is_empty() {
+        args.push(format!("python={short}"));
+    }
+    args
 }
 
 /// Arguments of `base -m venv location`. `-I` (isolated mode) keeps the working

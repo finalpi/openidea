@@ -1,10 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { cyclicExpandWord, expandCandidates, prefixStart } from "./wordCompletion";
 import type { OutlineItem } from "@/platform/ipc";
-import { pythonModulePath, qualifiedReference, rustImplType, rustModulePath } from "./copyReference";
+import {
+  copyReferenceToClipboard,
+  declaredName,
+  pythonModulePath,
+  qualifiedReference,
+  referenceOffset,
+  rustImplType,
+  rustModulePath,
+} from "./copyReference";
+import { writeClipboardText } from "@/platform/clipboard";
 import { declarationChain } from "./view/outline";
+
+vi.mock("@/platform/clipboard", () => ({ writeClipboardText: vi.fn(async () => {}) }));
 
 describe("cyclic expand word", () => {
   const text = "alphaOne x alphaTwo y al| alphaThree alphaOne";
@@ -52,6 +63,25 @@ describe("cyclic expand word", () => {
 describe("copy reference", () => {
   const base = { root: "/p", line: 4 };
 
+  it("writes the resolved reference through the shared clipboard helper", async () => {
+    vi.mocked(writeClipboardText).mockClear();
+    let finish!: (value: string) => void;
+    const reference = new Promise<string>((resolve) => {
+      finish = resolve;
+    });
+    const result = copyReferenceToClipboard(reference);
+    expect(writeClipboardText).not.toHaveBeenCalled();
+    finish("coordination_layer.db.key_scope.load_scoped");
+    await result;
+    expect(writeClipboardText).toHaveBeenCalledExactlyOnceWith("coordination_layer.db.key_scope.load_scoped");
+  });
+
+  it("does not overwrite the clipboard when reference resolution fails", async () => {
+    vi.mocked(writeClipboardText).mockClear();
+    await expect(copyReferenceToClipboard(Promise.reject(new Error("no symbol")))).rejects.toThrow("no symbol");
+    expect(writeClipboardText).not.toHaveBeenCalled();
+  });
+
   it("qualifies Java members with the package", () => {
     const text = "package com.acme.util;\n\nclass Strings {}";
     expect(
@@ -63,6 +93,25 @@ describe("copy reference", () => {
     expect(
       qualifiedReference({ ...base, language: "java", path: "/p/src/A.java", text: "", chain: ["A", "B", "m"] }),
     ).toBe("A.B#m");
+  });
+
+  it("qualifies Kotlin and Scala members like IDEA", () => {
+    const text = "package com.acme.util";
+    expect(
+      qualifiedReference({ ...base, language: "kotlin", path: "/p/src/Svc.kt", text, chain: ["Svc", "get"] }),
+    ).toBe("com.acme.util.Svc#get");
+    expect(
+      qualifiedReference({ ...base, language: "scala", path: "/p/src/Svc.scala", text, chain: ["Svc", "get"] }),
+    ).toBe("com.acme.util.Svc#get");
+  });
+
+  it("strips a language server's signature from a callable's name", () => {
+    expect(declaredName({ name: "getUserById(int)", kind: "method" })).toBe("getUserById");
+    expect(declaredName({ name: "UserService(int)", kind: "constructor" })).toBe("UserService");
+    expect(declaredName({ name: "run()", kind: "function" })).toBe("run");
+    // No signature, or a non-callable kind: the name is kept as is.
+    expect(declaredName({ name: "trim", kind: "method" })).toBe("trim");
+    expect(declaredName({ name: "Strings", kind: "class" })).toBe("Strings");
   });
 
   it("builds Rust paths from the module tree", () => {
@@ -84,6 +133,9 @@ describe("copy reference", () => {
 
   it("uses dotted module paths for Python and package names for Go", () => {
     expect(pythonModulePath("/p/src/pkg/mod.py", "/p")).toBe("pkg.mod");
+    expect(pythonModulePath("/p/services/live/src/coordination_layer/db/key_scope.py", "/p")).toBe(
+      "coordination_layer.db.key_scope",
+    );
     expect(pythonModulePath("/p/pkg/__init__.py", "/p")).toBe("pkg");
     expect(
       qualifiedReference({ ...base, language: "python", path: "/p/pkg/mod.py", text: "", chain: ["C", "m"] }),
@@ -94,6 +146,10 @@ describe("copy reference", () => {
   });
 
   it("falls back to path:line", () => {
+    expect(qualifiedReference({ ...base, language: "python", path: "/p/a.py", text: "", chain: [] })).toBe("a.py:5");
+    expect(qualifiedReference({ ...base, language: "rust", path: "/p/src/a.rs", text: "", chain: [] })).toBe(
+      "src/a.rs:5",
+    );
     expect(qualifiedReference({ ...base, language: "java", path: "/p/src/A.java", text: "", chain: [] })).toBe(
       "src/A.java:5",
     );
@@ -131,5 +187,12 @@ describe("copy reference", () => {
     expect(names(2, 6)).toEqual([]);
     expect(names(1, 2)).toEqual([]);
     expect(names(5, 0)).toEqual([]);
+  });
+
+  it("only resolves a selected identifier or an identifier under the caret", () => {
+    expect(referenceOffset("  load_scoped(x)", 2, 13)).toBe(2);
+    expect(referenceOffset("  load_scoped(x)", 5, 5)).toBe(5);
+    expect(referenceOffset("  load_scoped(x)", 0, 0)).toBeNull();
+    expect(referenceOffset("  load_scoped(x)", 2, 16)).toBeNull();
   });
 });

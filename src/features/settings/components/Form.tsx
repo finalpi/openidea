@@ -7,6 +7,8 @@ import { useId, useRef, useState, type KeyboardEvent, type ReactNode } from "rea
 import clsx from "clsx";
 import { Checkbox, IconButton, Input, Select as UiSelect, type SelectOption, T } from "@/ui";
 import { tx, useTx } from "@/platform/i18n";
+import { choosePath } from "@/platform/choosePath";
+import { isTauri } from "@/platform/ipc";
 import { highlightIndices } from "../model/pages";
 import { HEX_COLOR } from "../model/schema";
 import { useLabelMatch, useSearchQuery, useSetting } from "./context";
@@ -50,9 +52,21 @@ export function Section({ title, children, className }: { title?: string; childr
           <span className={styles.sectionRule} aria-hidden />
         </div>
       )}
-      <div className={styles.sectionBody}>{children}</div>
+      <FormGroup className={styles.sectionBody}>{children}</FormGroup>
     </section>
   );
+}
+
+export function FormGroup({
+  children,
+  indented,
+  className,
+}: {
+  children: ReactNode;
+  indented?: boolean;
+  className?: string;
+}) {
+  return <div className={clsx(styles.formGroup, indented && styles.indented, className)}>{children}</div>;
 }
 
 export interface RowProps {
@@ -63,14 +77,22 @@ export interface RowProps {
   htmlFor?: string;
   /** Control under the label (lists, previews) instead of beside it. */
   stacked?: boolean;
+  /** Dims the label; the control takes its own `disabled`. */
+  disabled?: boolean;
   className?: string;
 }
 
-export function Row({ label, hint, children, htmlFor, stacked, className }: RowProps) {
+export function Row({ label, hint, children, htmlFor, stacked, disabled, className }: RowProps) {
   const matched = useLabelMatch(label);
   return (
     <div
-      className={clsx(styles.row, stacked && styles.stacked, matched && styles.matched, className)}
+      className={clsx(
+        styles.row,
+        stacked && styles.stacked,
+        disabled && styles.disabled,
+        matched && styles.matched,
+        className,
+      )}
       data-search-match={matched || undefined}
     >
       <label className={styles.label} htmlFor={htmlFor}>
@@ -116,6 +138,7 @@ export interface NumberInputProps {
   /** Integer-only input. */
   integer?: boolean;
   unit?: string;
+  disabled?: boolean;
   "aria-label"?: string;
 }
 
@@ -131,7 +154,18 @@ export function parseNumberInput(
 }
 
 /** Number field: edits commit while valid; invalid text is flagged and reverted on blur. */
-export function NumberInput({ id, value, onChange, min, max, step = 1, integer, unit, ...aria }: NumberInputProps) {
+export function NumberInput({
+  id,
+  value,
+  onChange,
+  min,
+  max,
+  step = 1,
+  integer,
+  unit,
+  disabled,
+  ...aria
+}: NumberInputProps) {
   const [draft, setDraft] = useState<string | null>(null);
   const text = draft ?? String(value);
   const invalid = draft !== null && parseNumberInput(draft, { min, max, integer }) === null;
@@ -143,6 +177,7 @@ export function NumberInput({ id, value, onChange, min, max, step = 1, integer, 
         inputMode={integer ? "numeric" : "decimal"}
         value={text}
         invalid={invalid}
+        disabled={disabled}
         aria-label={aria["aria-label"]}
         aria-valuemin={min}
         aria-valuemax={max}
@@ -172,10 +207,19 @@ export interface SelectProps<V extends string> {
   onChange: (value: V) => void;
   disabled?: boolean;
   onPreview?: (value: V | null) => void;
+  className?: string;
   "aria-label"?: string;
 }
 
-export function Select<V extends string>({ value, options, onChange, disabled, onPreview, ...aria }: SelectProps<V>) {
+export function Select<V extends string>({
+  value,
+  options,
+  onChange,
+  disabled,
+  onPreview,
+  className,
+  ...aria
+}: SelectProps<V>) {
   return (
     <UiSelect<V>
       value={value}
@@ -183,7 +227,7 @@ export function Select<V extends string>({ value, options, onChange, disabled, o
       onChange={onChange}
       disabled={disabled}
       onPreview={onPreview}
-      className={styles.select}
+      className={clsx(styles.select, className)}
       aria-label={aria["aria-label"]}
     />
   );
@@ -191,7 +235,8 @@ export function Select<V extends string>({ value, options, onChange, disabled, o
 
 export interface ColorSwatchesProps {
   value: string;
-  presets: readonly { value: string; label: string }[];
+  /** `css`: how the swatch is drawn when `value` is a name rather than a colour. */
+  presets: readonly { value: string; label: string; css?: string }[];
   onChange: (value: string) => void;
   /** Offer a custom colour picker + hex field. */
   allowCustom?: boolean;
@@ -219,7 +264,7 @@ export function ColorSwatches({ value, presets, onChange, allowCustom = true, ..
             className={clsx(styles.swatch, on && styles.swatchOn)}
             onClick={() => onChange(p.value)}
           >
-            <span className={styles.swatchColor} style={{ background: p.value }} />
+            <span className={styles.swatchColor} style={{ background: p.css ?? p.value }} />
           </button>
         );
       })}
@@ -268,6 +313,8 @@ export interface GlobListEditorProps {
   emptyText?: string;
   /** Accessible name of the inline editor. */
   itemLabel?: string;
+  /** Entries are paths: + opens this chooser (Edit still takes typing). */
+  browse?: { directory: boolean; title: string };
 }
 
 /** Editable list of glob patterns (+ / − / edit toolbar, inline editing); also plain string lists. */
@@ -277,6 +324,7 @@ export function GlobListEditor({
   placeholder = "**/pattern",
   emptyText = "No patterns",
   itemLabel = "Pattern",
+  browse,
   ...aria
 }: GlobListEditorProps) {
   const [selected, setSelected] = useState<number | null>(null);
@@ -303,6 +351,19 @@ export function GlobListEditor({
     onChange([...new Set(next)]);
     setSelected(Math.min(editing.index, next.length - 1));
     setEditing(null);
+  };
+
+  const add = async () => {
+    // Outside the desktop app there is no chooser: type the path instead.
+    if (!browse || !isTauri()) {
+      setEditing({ index: value.length, text: "" });
+      return;
+    }
+    const picked = await choosePath({ ...browse, title: tx(browse.title) });
+    if (!picked) return;
+    const next = [...new Set([...value, picked])];
+    onChange(next);
+    setSelected(next.indexOf(picked));
   };
 
   const remove = () => {
@@ -345,12 +406,7 @@ export function GlobListEditor({
   return (
     <div className={styles.globEditor}>
       <div className={styles.listToolbar} role="toolbar" aria-controls={listId}>
-        <IconButton
-          icon="plus"
-          title="Add"
-          size="small"
-          onClick={() => setEditing({ index: value.length, text: "" })}
-        />
+        <IconButton icon="plus" title="Add" size="small" onClick={() => void add()} />
         <IconButton icon="minus" title="Remove" size="small" disabled={selected === null} onClick={remove} />
         <IconButton
           icon="edit"
@@ -411,20 +467,32 @@ export function GlobListEditor({
 // ---------------------------------------------------------------------------
 // Bound to settings keys
 
-export function SettingToggle({ k, label, hint }: { k: string; label: string; hint?: ReactNode }) {
+export function SettingToggle({
+  k,
+  label,
+  hint,
+  disabled,
+}: {
+  k: string;
+  label: string;
+  hint?: ReactNode;
+  disabled?: boolean;
+}) {
   const [value, set] = useSetting<boolean>(k);
-  return <Toggle label={label} checked={!!value} onChange={set} hint={hint} />;
+  return <Toggle label={label} checked={!!value} onChange={set} hint={hint} disabled={disabled} />;
 }
 
 export function SettingNumber({
   k,
   label,
   hint,
+  disabled,
   ...limits
 }: {
   k: string;
   label: string;
   hint?: ReactNode;
+  disabled?: boolean;
   min: number;
   max: number;
   step?: number;
@@ -434,8 +502,8 @@ export function SettingNumber({
   const [value, set] = useSetting<number>(k);
   const id = useId();
   return (
-    <Row label={label} hint={hint} htmlFor={id}>
-      <NumberInput id={id} value={value} onChange={set} aria-label={label} {...limits} />
+    <Row label={label} hint={hint} htmlFor={id} disabled={disabled}>
+      <NumberInput id={id} value={value} onChange={set} disabled={disabled} aria-label={label} {...limits} />
     </Row>
   );
 }
@@ -445,16 +513,18 @@ export function SettingSelect<V extends string>({
   label,
   hint,
   options,
+  disabled,
 }: {
   k: string;
   label: string;
   hint?: ReactNode;
   options: readonly SelectOption<V>[];
+  disabled?: boolean;
 }) {
   const [value, set] = useSetting<V>(k);
   return (
-    <Row label={label} hint={hint}>
-      <Select<V> value={value} options={options} onChange={set} aria-label={label} />
+    <Row label={label} hint={hint} disabled={disabled}>
+      <Select<V> value={value} options={options} onChange={set} disabled={disabled} aria-label={label} />
     </Row>
   );
 }
@@ -464,21 +534,24 @@ export function SettingText({
   label,
   hint,
   placeholder,
+  disabled,
 }: {
   k: string;
   label: string;
   hint?: ReactNode;
   placeholder?: string;
+  disabled?: boolean;
 }) {
   const [value, set] = useSetting<string>(k);
   const id = useId();
   return (
-    <Row label={label} hint={hint} htmlFor={id}>
+    <Row label={label} hint={hint} htmlFor={id} disabled={disabled}>
       <Input
         id={id}
         className={styles.text}
         value={value ?? ""}
         placeholder={placeholder}
+        disabled={disabled}
         onChange={(e) => set(e.target.value)}
       />
     </Row>

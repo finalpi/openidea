@@ -1,20 +1,36 @@
 import { shortcutLabel } from "@/platform/keymap";
 import { IconButton, type MenuItem } from "@/ui";
-import { VIEW_MODES, setViewMode, setViewOption, useProjectTree, type ViewOptions } from "./store";
+import { useProject } from "@/platform/project";
+import { userScopes } from "@/platform/scopes";
+import { VIEW_MODES, setScopeView, setViewMode, setViewOption, useProjectTree, type ViewOptions } from "./store";
 import type { SortKey } from "./model";
 
 /** The title's "Project ▾" pane switcher (IDEA: Project / Project Files / Open Files / …). */
 export function useProjectTitleMenu(): { label: string; items: MenuItem[] } {
   const mode = useProjectTree((s) => s.mode);
+  const scope = useProjectTree((s) => s.scope);
   const unity = useProjectTree((s) => s.unity);
+  // User scopes (Settings › Scopes) follow the built-in panes, as in IDEA.
+  const scopes = userScopes(useProject((s) => (s.settings as { scopes?: unknown } | null)?.scopes));
+  const items: MenuItem[] = VIEW_MODES.filter(([id]) => id !== "unity" || unity).map(([id, label]) => ({
+    id,
+    label,
+    checked: id === mode,
+    run: () => setViewMode(id),
+  }));
+  if (scopes.length) {
+    items.push({ kind: "separator" });
+    for (const s of scopes)
+      items.push({
+        id: `scope:${s.name}`,
+        label: s.name,
+        checked: mode === "scope" && scope === s.name,
+        run: () => setScopeView(s.name),
+      });
+  }
   return {
-    label: VIEW_MODES.find(([id]) => id === mode)?.[1] ?? "Project",
-    items: VIEW_MODES.filter(([id]) => id !== "unity" || unity).map(([id, label]) => ({
-      id,
-      label,
-      checked: id === mode,
-      run: () => setViewMode(id),
-    })),
+    label: mode === "scope" ? (scope ?? "Project") : (VIEW_MODES.find(([id]) => id === mode)?.[1] ?? "Project"),
+    items,
   };
 }
 
@@ -27,26 +43,35 @@ export const OPTION_LABELS: Array<[ToggleOption, string]> = [
   ["showHidden", "Show Hidden Files"],
   ["showExcluded", "Show Excluded Files"],
   ["showMembers", "Show Members"],
+  ["showRootPaths", "Show Root Paths"],
+  ["horizontalScroll", "Horizontal Scrolling"],
   ["compact", "Compact Middle Packages"],
   ["foldersFirst", "Sort Folders First"],
+  ["autoscrollFromSource", "Always Select Opened File"],
   ["autoscrollToSource", "Autoscroll to Source"],
-  ["autoscrollFromSource", "Autoscroll from Source"],
   ["singleClickOpen", "Open Files with Single Click"],
   ["singleClickExpand", "Expand Directories with Single Click"],
   ["previewTab", "Enable Preview Tab"],
 ];
 
+/** The first entries of OPTION_LABELS are Appearance options, the rest Behavior. */
+const APPEARANCE_OPTIONS = 7;
+
 /** Header controls of the Project tool window (IDEA: Locate, Expand/Collapse All). */
 export function ProjectHeaderActions() {
+  // IDEA hides Select Opened File while Always Select Opened File keeps the tree in sync.
+  const alwaysSelect = useProjectTree((s) => s.options.autoscrollFromSource);
   return (
     <>
-      <IconButton
-        icon="locate"
-        action="navigate.selectInProjectView"
-        title="Select Opened File"
-        shortcut={shortcutLabel("navigate.selectInProjectView")}
-        size="small"
-      />
+      {!alwaysSelect && (
+        <IconButton
+          icon="locate"
+          action="navigate.selectInProjectView"
+          title="Select Opened File"
+          shortcut={shortcutLabel("navigate.selectInProjectView")}
+          size="small"
+        />
+      )}
       <IconButton icon="expand-all" action="project.expandAll" title="Expand All" size="small" />
       <IconButton icon="collapse-all" action="project.collapseAll" title="Collapse All" size="small" />
     </>
@@ -71,7 +96,7 @@ export function useProjectHeaderMenu(): MenuItem[] {
           option("showUnityGenerated", "Show Generated Files", options),
         ]
       : []),
-    ...OPTION_LABELS.slice(0, 5).map(([key, label]) => option(key, label, options)),
+    ...OPTION_LABELS.slice(0, APPEARANCE_OPTIONS).map(([key, label]) => option(key, label, options)),
     { kind: "separator" },
     ...SORT_LABELS.map(([sortBy, label]): MenuItem => ({
       id: `sort.${sortBy}`,
@@ -81,7 +106,7 @@ export function useProjectHeaderMenu(): MenuItem[] {
     })),
     { kind: "separator" },
     { kind: "header", label: "Behavior" },
-    ...OPTION_LABELS.slice(5).map(([key, label]) => option(key, label, options)),
+    ...OPTION_LABELS.slice(APPEARANCE_OPTIONS).map(([key, label]) => option(key, label, options)),
   ];
 }
 

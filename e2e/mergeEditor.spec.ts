@@ -1,3 +1,4 @@
+import type { EditorView } from "@codemirror/view";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./fixtures";
 
@@ -62,6 +63,44 @@ const result = (page: Page) => page.getByRole("region", { name: "Result" });
 const text = async (pane: Locator) => (await pane.locator(".cm-content").innerText()).replace(/​/g, "");
 const status = (page: Page) => page.locator("#merge-host [class*=status]").first();
 
+test("merge controls and pane titles fit while resizing the result", async ({ page }) => {
+  await page.setViewportSize({ width: 400, height: 600 });
+  await mountMerge(page);
+  const host = page.locator("#merge-host");
+  for (const name of ["Accept Yours", "Accept Theirs", "Cancel", "Apply"])
+    await expect(host.getByRole("button", { name, exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(status(page)).toHaveText("3 changes left, 2 conflicts");
+  await expect(status(page)).toBeInViewport({ ratio: 1 });
+
+  const ours = page.getByRole("region", { name: "Your version" });
+  await expect(ours.getByText("Your version", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Their version" }).getByText("Their version", { exact: true }),
+  ).toBeVisible();
+  await ours.locator(".cm-merge-accept").nth(1).focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => text(result(page))).toContain("\nmine\n");
+
+  await page.setViewportSize({ width: 980, height: 660 });
+  const resultWidth = async () => (await result(page).boundingBox())!.width;
+  const initial = await resultWidth();
+  const left = host.getByRole("separator", { name: "Resize left merge pane" });
+  await left.press("ArrowLeft");
+  await expect.poll(resultWidth).toBeGreaterThan(initial + 1);
+
+  const right = host.getByRole("separator", { name: "Resize right merge pane" });
+  const grip = (await right.boundingBox())!;
+  const withLeftResized = await resultWidth();
+  await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(grip.x + grip.width / 2 + 36, grip.y + grip.height / 2, { steps: 4 });
+  await page.mouse.up();
+  await expect.poll(resultWidth).toBeGreaterThan(withLeftResized + 20);
+  await expect(result(page).getByText("Result", { exact: true })).toBeVisible();
+  await expect(ours.getByText("Changes from main", { exact: true })).toBeVisible();
+  await expect.poll(() => text(result(page))).toContain("\nmine\n");
+});
+
 /** Capture the save boundary, keeping real editor state, dialogs and Apply behavior. */
 async function captureWrites(page: Page) {
   await page.evaluate(async () => {
@@ -121,6 +160,23 @@ test("Apply writes and stages unresolved text only after confirmation", async ({
   expect((await writes(page))[0]!.args[2]).toEqual({ changes: [{ from: 0, to: 13, insert: BASE }] });
 });
 
+test("footer buttons work when a click doesn't focus them, as in WebKit", async ({ page }) => {
+  await mountMerge(page);
+  await result(page).locator(".cm-content").click();
+  // WebKit focuses the clicked button's nearest focusable ancestor, not the button.
+  await page
+    .locator("#merge-host")
+    .getByRole("button", { name: "Apply", exact: true })
+    .evaluate((button) => {
+      let target = button.parentElement;
+      while (target && !target.hasAttribute("tabindex")) target = target.parentElement;
+      if (target) target.focus();
+      else (document.activeElement as HTMLElement | null)?.blur();
+      (button as HTMLButtonElement).click();
+    });
+  await expect(page.getByRole("dialog")).toContainText("Save and mark the file as resolved anyway?");
+});
+
 test("binary and unreadable versions show an error with no Apply controls", async ({ page }) => {
   await mountMerge(page, ["\0base", "\0ours", "\0theirs"]);
   await expect(page.locator("#merge-host")).toContainText("Binary files cannot be resolved in the merge editor.");
@@ -152,6 +208,20 @@ test("accepting a deleted version removes the file before staging", async ({ pag
     { command: "fsDelete", args: ["/project/demo.ts"] },
     { command: "vcsStage", args: [["/project/demo.ts"]] },
   ]);
+});
+
+test("a long side shows only the lines it changed against the base", async ({ page }) => {
+  // Edits spread over a long file make the default diff give up and mark everything between them.
+  const base = Array.from({ length: 2000 }, (_, i) => `"node_modules/pkg-${i}": "1.0.${i}",`);
+  const bump = (at: number) => lines(...base.map((l, i) => (i % 100 === at ? l.replace('"1.0.', '"2.0.') : l)));
+  await mountMerge(page, [lines(...base), bump(3), bump(50)]);
+  for (const [name, line] of [
+    ["Your version", 3],
+    ["Their version", 50],
+  ] as const) {
+    const deleted = page.getByRole("region", { name }).locator(".cm-deletedChunk").first().locator(".cm-deletedLine");
+    await expect(deleted).toHaveText([base[line]!]);
+  }
 });
 
 test("the result starts as the base and every change waits for a decision", async ({ page }) => {
@@ -205,6 +275,7 @@ test("the toolbar applies the non-conflicting changes of one side", async ({ pag
   await expect(page.getByRole("button", { name: "Apply Non-Conflicting Changes from the Left Side" })).toBeDisabled();
   await page.getByRole("button", { name: "Apply Non-Conflicting Changes from the Right Side" }).click();
   await expect(status(page)).toHaveText("2 changes left, 2 conflicts");
+  await expect(result(page).locator(".cm-editor")).toHaveClass(/cm-focused/);
   expect(await text(result(page))).toContain("\nC\n");
   await expect(page.getByRole("button", { name: "Apply All Non-Conflicting Changes" })).toBeDisabled();
 });
@@ -342,4 +413,60 @@ test("merge actions follow the focused instance and survive a context menu", asy
   await page.getByRole("menuitem", { name: "Ignore", exact: true }).click();
   await expect(second.locator("[class*=status]").first()).toHaveText("2 changes left, 1 conflict");
   await expect(status(page)).toHaveText("1 change left, 1 conflict");
+});
+
+test("difference navigation focuses and centres the merge result caret with synchronized sides", async ({ page }) => {
+  const base = Array.from({ length: 800 }, (_, i) => `const value${i} = ${i};`);
+  const ours = [...base];
+  const theirs = [...base];
+  for (const i of [100, 400, 700]) {
+    ours[i] = `const ours${i} = ${i};`;
+    theirs[i] = `const theirs${i} = ${i};`;
+  }
+  await mountMerge(page, [base.join("\n"), ours.join("\n"), theirs.join("\n")]);
+  const pane = result(page);
+  const check = async (line: number) => {
+    await expect(pane.locator(".cm-editor")).toHaveClass(/cm-focused/);
+    await expect
+      .poll(() =>
+        pane.locator(".cm-content").evaluate((content) => {
+          const view = (content as HTMLElement & { cmTile: { view: EditorView } }).cmTile.view;
+          const head = view.state.selection.main.head;
+          const at = view.state.doc.lineAt(head);
+          const rect = view.scrollDOM.getBoundingClientRect();
+          const coords = view.coordsAtPos(head)!;
+          return {
+            line: at.number,
+            column: head - at.from,
+            centred: Math.abs((coords.top + coords.bottom) / 2 - rect.top - rect.height / 2) < 3,
+            cursor: getComputedStyle(view.dom.querySelector(".cm-cursor")!).display !== "none",
+            blinking: /cm-blink/.test(getComputedStyle(view.dom.querySelector(".cm-cursorLayer")!).animationName),
+          };
+        }),
+      )
+      .toEqual({ line, column: 0, centred: true, cursor: true, blinking: true });
+    await expect
+      .poll(async () => {
+        const tops = await page.locator("#merge-host .cm-content").evaluateAll(
+          (els, line) =>
+            els.map((content) => {
+              const view = (content as HTMLElement & { cmTile: { view: EditorView } }).cmTile.view;
+              return view.documentTop + view.lineBlockAt(view.state.doc.line(line).from).top;
+            }),
+          line,
+        );
+        return Math.max(...tops) - Math.min(...tops);
+      })
+      .toBeLessThan(2);
+  };
+  await page.getByRole("button", { name: "Next Change", exact: true }).click();
+  await check(101);
+  await page.keyboard.press("F7");
+  await check(401);
+  await page.keyboard.press("F7");
+  await check(701);
+  await page.getByRole("button", { name: "Previous Change", exact: true }).click();
+  await check(401);
+  await page.keyboard.press("Shift+F7");
+  await check(101);
 });

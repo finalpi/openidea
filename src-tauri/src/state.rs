@@ -1,11 +1,11 @@
-use crate::events::TauriSink;
+use crate::events::{TauriSink, coalescing_sink};
 use ide_core::{EventSink, IdeEvent, IdeResult, SharedSink};
 use ide_language::{LanguageRegistry, Syntax};
 use ide_workspace::RecentProjects;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 pub use ide_host::{Host, Project};
 
@@ -15,11 +15,10 @@ pub struct AppState {
     pub app: AppHandle,
     pub host: Arc<Host>,
     pub startup: Startup,
+    pub updates: crate::updates::Updates,
     pub recent: RecentProjects,
     /// Plugins (`ide_host::plugins`), shared by all windows.
     pub plugins: Arc<ide_host::plugins::PluginHost>,
-    /// The built-in web server (Open In › Browser, the editor's browser bar).
-    pub web: ide_web::WebServer,
     /// Credential prompts of `ssh` / `git` child processes (`None` if it failed to start).
     pub askpass: Option<ide_ssh::askpass::AskpassServer>,
     /// Remote development connections, by window label.
@@ -49,7 +48,7 @@ pub struct Startup {
 }
 
 impl AppState {
-    pub fn new(app: AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(app: AppHandle, local_data_dir: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         ide_workspace::process::mark_start();
         let process_to_main = ide_workspace::process::before_main();
         let process_to_setup = ide_workspace::process::process_age();
@@ -62,9 +61,9 @@ impl AppState {
                 syntax.get_or_init(|| Arc::new(Syntax::new()));
             })?;
         }
-        let config_dir = app.path().app_config_dir()?;
-        let data_dir = app.path().app_data_dir()?;
-        let local_data_dir = app.path().app_local_data_dir()?;
+        // `OPENIDEA_CONFIG_DIR` / `OPENIDEA_DATA_DIR` move these; an unusable value fails the start.
+        let config_dir = ide_host::data_dirs::config_dir(&app.config().identifier)?;
+        let data_dir = ide_host::data_dirs::data_dir(&app.config().identifier)?;
         std::fs::create_dir_all(&config_dir)?;
         std::fs::create_dir_all(&data_dir)?;
         if let Err(error) = std::fs::create_dir_all(&local_data_dir) {
@@ -73,15 +72,22 @@ impl AppState {
         tracing::info!(?data_dir, ?local_data_dir, "application data directories");
         // Saved git HTTPS credentials (askpass answers them silently).
         ide_ssh::git_creds::init(data_dir.join("git-credentials.json"));
+        // A newly chosen local-data directory from Settings › System Settings ›
+        // Caches: the previous tree moves first, so a pending invalidation still
+        // wipes what was just moved.
+        let identifier = app.config().identifier.clone();
+        ide_host::data_dirs::apply_custom_migration(&identifier, &local_data_dir);
         // File › Invalidate Caches… requested at the last run.
         let removed = ide_workspace::caches::apply_pending(&data_dir, &local_data_dir);
         if !removed.is_empty() {
             tracing::info!("invalidated caches: {removed:?}");
         }
         ide_host::data_dirs::migrate(&data_dir, &local_data_dir);
-        let global_sink: SharedSink = Arc::new(TauriSink { app: app.clone(), window: None });
+        let runtime = tauri::async_runtime::handle().inner().clone();
+        let global_sink = coalescing_sink(Arc::new(TauriSink { app: app.clone(), window: None }), runtime.clone());
         let languages = Arc::new(LanguageRegistry::load(Some(&config_dir.join("languages")))?);
         let sink_app = app.clone();
+        let sink_runtime = runtime.clone();
         let host = Arc::new(Host::new(ide_host::HostConfig {
             config_dir: config_dir.clone(),
             data_dir: data_dir.clone(),
@@ -89,18 +95,24 @@ impl AppState {
             languages: languages.clone(),
             syntax,
             sink_for: Box::new(move |window| {
-                Arc::new(TauriSink { app: sink_app.clone(), window: Some(window.to_owned()) })
+                coalescing_sink(
+                    Arc::new(TauriSink { app: sink_app.clone(), window: Some(window.to_owned()) }),
+                    sink_runtime.clone(),
+                )
             }),
             owner: Self::owner_window,
-            runtime: tauri::async_runtime::handle().inner().clone(),
+            runtime,
             project_environment: false,
         }));
+        let announce = global_sink.clone();
+        host.set_background_projects_observer(Arc::new(move || announce.emit(IdeEvent::McpBackgroundProjectsChanged)));
+        host.start_background_sweeper();
         Ok(Self {
             recent: RecentProjects::load(&config_dir),
+            updates: Default::default(),
             askpass: start_askpass(&app),
             sink: global_sink,
             plugins: crate::commands::plugin::create_host(&app, &data_dir, &host)?,
-            web: ide_web::WebServer::new(),
             remote_dev: crate::remote_dev::Connections::default(),
             host,
             startup: Startup {
@@ -136,27 +148,46 @@ impl AppState {
 
     /// Opens `root` in `window` and records it in the recent projects.
     pub fn open_project(&self, window: &str, root: &Path) -> IdeResult<Arc<Project>> {
-        // A local project replaces a remote one in this window.
-        self.remote_dev.disconnect(window);
         let project = self.host.open_project(window, root)?;
-        let branch = project.repos.read().primary().and_then(|r| r.branch_info().ok()).and_then(|b| b.head);
-        self.recent.touch(&project.root, branch)?;
-        let display_name = project.settings.effective().general.project_name;
-        if !display_name.trim().is_empty() {
-            self.recent.rename(&project.root, Some(display_name.trim()))?;
-        }
+        self.record_project(&project)?;
+        // Drop the remote connection only once the local project is actually open.
+        // A failed open leaves the window on the host it is still routing to.
+        self.remote_dev.disconnect(window);
         Ok(project)
+    }
+
+    pub fn record_project(&self, project: &Project) -> IdeResult<()> {
+        let info = ide_host::ops::project::info(project);
+        let attached = info.workspace.as_ref().is_some_and(|w| !w.is_container(&project.root));
+        let branch = if attached {
+            None
+        } else {
+            project.repos.read().primary().and_then(|r| r.branch_info().ok()).and_then(|b| b.head)
+        };
+        self.recent.touch(&project.root, branch)?;
+        self.recent.rename(&project.root, Some(&info.display_name))?;
+        crate::jump_list::refresh(&self.app, self.recent.list());
+        Ok(())
     }
 
     /// Opens `window` for editing the loose file `file` (LightEdit); not a recent project.
     pub fn open_light(&self, window: &str, file: &Path) -> IdeResult<Arc<Project>> {
+        let project = self.host.open_light(window, file)?;
         self.remote_dev.disconnect(window);
-        self.host.open_light(window, file)
+        Ok(project)
+    }
+
+    /// LightEdit without a file (File › New File from a welcome window).
+    pub fn open_light_empty(&self, window: &str) -> IdeResult<Arc<Project>> {
+        let project = self.host.open_light_empty(window)?;
+        self.remote_dev.disconnect(window);
+        Ok(project)
     }
 
     /// Called on the event-loop thread (window destruction, the `close_project`
     /// command), so it must not wait for the project's workers to shut down.
     pub fn close_project(&self, window: &str) {
+        crate::system_notifications::clear_window(window);
         self.remote_dev.disconnect(window);
         self.host.close_project_detached(window);
     }

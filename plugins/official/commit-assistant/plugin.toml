@@ -1,17 +1,17 @@
 id = "finalpi.commit-assistant"
 name = "Commit Assistant"
-version = "0.2.0"
+version = "0.2.1"
 description = "Generate a commit message from selected or staged changes, offline or with your OpenAI-compatible API. Runs only when requested."
 authors = ["finalpi"]
 license = "Apache-2.0"
 categories = ["vcs", "ai"]
-engines.openidea = "^1.0"
+engines.openidea = "^1.14"
 wasm = "dist/plugin.wasm"
 activation = ["on-command:*"]
 
 [capabilities]
 required = ["project.read", "process:git"]
-optional = ["net:*", "secrets", "clipboard"]
+optional = ["net:ask", "secrets", "clipboard"]
 
 [[contributes.commands]]
 id = "generate-ai"
@@ -38,7 +38,7 @@ supportsSelection = true
 [[contributes.secrets]]
 name = "api-key"
 label = "API Key"
-description = "Sent only to the endpoint you configure, when you choose AI generation. Stored by the IDE, not in settings."
+description = "Sent to the configured endpoint for AI generation, model refresh, and connection tests. Stored by the IDE, not in settings."
 
 [contributes.settings]
 title = "Commit Assistant"

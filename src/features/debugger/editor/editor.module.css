@@ -126,11 +126,11 @@
 
 /* Beat the caret row (`.cm-activeLine`), as IDEA does; the suspended line wins over a breakpoint. */
 :global(.cm-editor) :global(.cm-line).bpLine {
-  background: var(--bg-breakpoint-line);
+  --openidea-line-bg: var(--bg-breakpoint-line);
 }
 
 :global(.cm-editor) :global(.cm-line).execLine {
-  background: var(--bg-debug-line);
+  --openidea-line-bg: var(--bg-debug-line);
 }
 
 .inlineValue {
@@ -144,6 +144,31 @@
   user-select: none;
 }
 
+.inlineValuePart {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.inlineValuePart:hover {
+  text-decoration: underline;
+}
+
+.inlineShow {
+  margin-left: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--link);
+  font: inherit;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.inlineShow:hover {
+  color: var(--link-hover);
+  text-decoration: underline;
+}
+
 /* Data Views › Show value tooltip on mouse hover. */
 .valueTooltip {
   max-width: 520px;
@@ -155,8 +180,21 @@
   word-break: break-word;
 }
 .valueTooltipTree {
-  padding: 2px 0;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: min(460px, calc(var(--debug-value-editor-width, 100vw) - var(--space-2)));
+  max-width: 100%;
+  height: min(260px, 50vh);
+  padding: 0;
+  font-family: var(--font-ui);
   white-space: normal;
+}
+:global(.cm-lsp-hint):has(> .valueTooltipTree) {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
 }
 .valueExpand {
   display: inline-flex;

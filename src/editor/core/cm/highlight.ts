@@ -4,7 +4,17 @@
  * -effect`, set by Settings › Editor › Color Scheme overrides.
  */
 import { HighlightStyle, type TagStyle } from "@codemirror/language";
-import { tags as t, type Tag } from "@lezer/highlight";
+import { Tag, tags as t } from "@lezer/highlight";
+
+/** Log warnings: the UI warning colour, since no syntax token reads as one in every scheme. */
+export const logWarning = Tag.define("logWarning");
+export const parameter = Tag.define(t.variableName);
+/** A shell command name: its own colour in JetBrains schemes, else a function call. */
+export const shellCommand = Tag.define("shellCommand");
+/** Inside doc comments, as IntelliJ colours them: `@param` / `{@link`, a `@param` name, HTML markup. */
+export const docCommentTag = Tag.define(t.docComment);
+export const docCommentTagValue = Tag.define(t.docComment);
+export const docCommentMarkup = Tag.define(t.docComment);
 
 function token(
   tag: Tag | Tag[],
@@ -52,6 +62,7 @@ export const openideaHighlightStyle = HighlightStyle.define([
   token([t.typeName, t.className, t.namespace, t.definition(t.typeName)], "type"),
   token([t.standard(t.typeName), t.standard(t.variableName), t.standard(t.function(t.variableName))], "builtin"),
   token([t.function(t.variableName), t.function(t.propertyName)], "function-call"),
+  token(shellCommand, "shell-command", { color: "function-call" }),
   token(
     [
       t.function(t.definition(t.variableName)),
@@ -62,6 +73,9 @@ export const openideaHighlightStyle = HighlightStyle.define([
   ),
   token([t.comment, t.lineComment, t.blockComment], "comment", { italic: "var(--syn-comment-style)" }),
   token(t.docComment, "doc-comment", { italic: "italic" }),
+  token(docCommentTag, "doc-comment-tag", { italic: "normal", bold: "var(--fw-code, 400)" }),
+  token(docCommentTagValue, "doc-comment-tag-value", { italic: "normal", bold: "var(--fw-code, 400)" }),
+  token(docCommentMarkup, "doc-markup", { italic: "normal", bold: "var(--fw-code, 400)" }),
   token([t.meta, t.annotation, t.macroName], "decorator"),
   // `<!doctype>` is a sub-tag of `meta`; PyCharm leaves the XML prologue as plain text.
   { tag: t.documentMeta, color: "var(--fg-editor)" },
@@ -69,6 +83,7 @@ export const openideaHighlightStyle = HighlightStyle.define([
   token(t.labelName, "constant"),
   token([t.variableName, t.definition(t.variableName), t.local(t.variableName)], "variable"),
   token([t.propertyName, t.definition(t.propertyName)], "property"),
+  token(parameter, "param"),
   token(t.attributeName, "attribute"),
   token(t.special(t.brace), "decorator"),
   token([t.tagName, t.angleBracket], "tag"),
@@ -86,6 +101,7 @@ export const openideaHighlightStyle = HighlightStyle.define([
   token(t.url, "function", { italic: "italic" }),
   token(t.monospace, "markup-code"),
   token(t.contentSeparator, "keyword"),
+  { tag: logWarning, color: "var(--warning)" },
   { tag: t.inserted, color: "var(--vcs-added)" },
   { tag: t.deleted, color: "var(--danger)" },
   { tag: t.changed, color: "var(--vcs-modified)" },

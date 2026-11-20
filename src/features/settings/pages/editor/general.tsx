@@ -8,9 +8,10 @@
 import { useEffect, useId, useState } from "react";
 import clsx from "clsx";
 import { commands, isTauri } from "@/platform/ipc";
-import { Checkbox } from "@/ui";
+import { Checkbox, Icon, type IconName } from "@/ui";
 import { SearchLabel, Select } from "../../components/Form";
-import { useLabelMatch, useSetting } from "../../components/context";
+import { useLabelMatch, useSearchQuery, useSetting } from "../../components/context";
+import { labelMatches } from "../../model/pages";
 import { editorPage, type Item } from "./kit";
 import styles from "./Editor.module.css";
 import { tx } from "@/platform/i18n";
@@ -115,7 +116,19 @@ const GENERAL = editorPage({
     {
       title: "Mouse Control",
       items: [
-        { t: "check", key: `${P}.general.wheelZoom`, label: "Change font size with Command+Mouse Wheel" },
+        {
+          t: "check",
+          key: `${P}.general.wheelZoom`,
+          label: "Change font size with Ctrl/Command+Mouse Wheel",
+          inline: {
+            kind: "select",
+            key: `${P}.general.wheelZoomScope`,
+            options: [
+              { value: "active", label: "Active editor" },
+              { value: "all", label: "All editors" },
+            ],
+          },
+        },
         { t: "check", key: `${P}.general.dragAndDrop`, label: "Enable drag-and-drop functionality in editor" },
       ],
     },
@@ -197,10 +210,20 @@ const AUTO_IMPORT = editorPage({
   id: "editor.general.autoImport",
   title: "Auto Import",
   order: 0,
-  keywords: ["import", "organize imports", "unambiguous"],
+  keywords: ["import", "organize imports", "unambiguous", "paste"],
   sections: [
     {
       items: [
+        {
+          t: "select",
+          key: `${P}.autoImport.importsOnPaste`,
+          label: "Insert imports on paste",
+          options: [
+            { value: "always", label: "Always" },
+            { value: "ask", label: "Ask" },
+            { value: "never", label: "Never" },
+          ],
+        },
         {
           t: "check",
           key: `${P}.autoImport.addUnambiguous`,
@@ -225,6 +248,7 @@ const APPEARANCE = editorPage({
   keywords: ["caret", "line numbers", "whitespace", "indent guides", "distraction free", "zen"],
   sections: [
     {
+      title: "Caret",
       items: [
         {
           t: "check",
@@ -247,13 +271,42 @@ const APPEARANCE = editorPage({
             ],
           },
         },
+      ],
+    },
+    {
+      title: "Code Structure",
+      items: [
         {
           t: "check",
           key: `${P}.appearance.hardWrapGuides`,
           label: "Show hard wrap and visual guides (configured in Code Style options)",
         },
-        { t: "check", key: `${P}.appearance.lineNumbers`, label: "Show line numbers" },
+        {
+          t: "check",
+          key: `${P}.appearance.lineNumbers`,
+          label: "Show line numbers",
+          inline: {
+            kind: "select",
+            key: `${P}.appearance.lineNumberMode`,
+            options: [
+              { value: "absolute", label: "Absolute" },
+              { value: "relative", label: "Relative" },
+              { value: "hybrid", label: "Hybrid" },
+            ],
+          },
+        },
         { t: "check", key: `${P}.appearance.methodSeparators`, label: "Show method separators" },
+        {
+          t: "check",
+          key: `${P}.appearance.indentGuides`,
+          label: "Show indent guides",
+          children: [{ t: "check", key: `${P}.appearance.rainbowIndentGuides`, label: "Rainbow indent guides" }],
+        },
+      ],
+    },
+    {
+      title: "Presentation",
+      items: [
         {
           t: "check",
           key: `${P}.showWhitespace`,
@@ -264,8 +317,11 @@ const APPEARANCE = editorPage({
             { t: "check", key: `${P}.appearance.whitespaceTrailing`, label: "Trailing" },
           ],
         },
-        { t: "check", key: `${P}.appearance.indentGuides`, label: "Show indent guides" },
-        { t: "check", key: `${P}.appearance.intentionBulb`, label: "Show intention bulb" },
+        {
+          t: "check",
+          key: `${P}.appearance.renderDocComments`,
+          label: "Render documentation comments",
+        },
         {
           t: "number",
           key: `${P}.appearance.distractionFreeWidth`,
@@ -275,6 +331,10 @@ const APPEARANCE = editorPage({
           unit: "chars",
         },
       ],
+    },
+    {
+      title: "Code Assistance",
+      items: [{ t: "check", key: `${P}.appearance.intentionBulb`, label: "Show intention bulb" }],
     },
   ],
 });
@@ -566,6 +626,29 @@ function CloseButtonPosition() {
   );
 }
 
+const GUTTER_OPTIONS: ReadonlyArray<{ id: string; label: string; icon?: IconName; keywords?: string[] }> = [
+  {
+    id: "run",
+    label: "Run configurations and tests",
+    icon: "gutter-run",
+    keywords: ["Run", "run configurations", "test"],
+  },
+  { id: "bookmarks", label: "Bookmarks", icon: "bookmark" },
+  {
+    id: "inheritors",
+    label: "Implemented and overridden declarations",
+    icon: "gutter-implemented",
+    keywords: ["Implemented and overridden", "implementations", "subclasses", "inheritors"],
+  },
+  {
+    id: "supers",
+    label: "Implementing and overriding methods",
+    icon: "gutter-implementing",
+    keywords: ["Implementing and overriding", "super method", "overrides", "implements"],
+  },
+  { id: "colors", label: "Color preview", keywords: ["color", "swatch", "colour"] },
+];
+
 const GUTTER = editorPage({
   id: "editor.general.gutterIcons",
   title: "Gutter Icons",
@@ -573,56 +656,46 @@ const GUTTER = editorPage({
   sections: [
     {
       items: [
+        { t: "check", key: `${P}.showGutterIcons`, label: "Show gutter icons" },
         {
-          t: "check",
-          key: `${P}.showGutterIcons`,
-          label: "Show gutter icons",
-          children: [
-            {
-              t: "custom",
-              label: "Run",
-              keywords: ["run configurations", "test"],
-              component: () => <GutterGroup id="run" label="Run configurations and tests" />,
-            },
-            { t: "custom", label: "Bookmarks", component: () => <GutterGroup id="bookmarks" label="Bookmarks" /> },
-            {
-              t: "custom",
-              label: "Implemented and overridden",
-              keywords: ["implementations", "subclasses", "inheritors"],
-              component: () => <GutterGroup id="inheritors" label="Implemented and overridden declarations" />,
-            },
-            {
-              t: "custom",
-              label: "Implementing and overriding",
-              keywords: ["super method", "overrides", "implements"],
-              component: () => <GutterGroup id="supers" label="Implementing and overriding methods" />,
-            },
-            {
-              t: "custom",
-              label: "Color preview",
-              keywords: ["color", "swatch", "colour"],
-              component: () => <GutterGroup id="colors" label="Color preview" />,
-            },
-          ],
+          t: "custom",
+          label: "Gutter Icons",
+          keywords: GUTTER_OPTIONS.flatMap(({ label, keywords }) => [label, ...(keywords ?? [])]),
+          component: GutterIconList,
         },
       ],
     },
   ],
 });
 
-function GutterGroup({ id, label }: { id: string; label: string }) {
+function GutterIconList() {
   const [disabled, set] = useSetting<string[]>(`${P}.gutterIconsDisabled`);
   const [master] = useSetting<boolean>(`${P}.showGutterIcons`);
-  const matched = useLabelMatch(label);
+  const query = useSearchQuery();
   return (
-    <div className={matched ? `${styles.check} ${styles.matched}` : styles.check}>
-      <Checkbox
-        checked={!disabled.includes(id)}
-        disabled={!master}
-        label={<SearchLabel text={label} />}
-        onChange={(on) => set(on ? disabled.filter((x) => x !== id) : [...disabled, id])}
-      />
-    </div>
+    <ul role="list" aria-label={tx("Gutter Icons")} className={styles.gutterIconList}>
+      {GUTTER_OPTIONS.map(({ id, label, icon }) => {
+        const matched = labelMatches(label, query);
+        return (
+          <li
+            key={id}
+            className={clsx(styles.gutterIconRow, matched && styles.matched)}
+            data-search-match={matched || undefined}
+          >
+            <span className={styles.gutterIconPreview} aria-hidden>
+              {icon ? <Icon name={icon} size={16} /> : <span className={styles.gutterSwatch} />}
+            </span>
+            <Checkbox
+              className={styles.gutterIconChoice}
+              checked={!disabled.includes(id)}
+              disabled={!master}
+              label={<SearchLabel text={label} />}
+              onChange={(on) => set(on ? disabled.filter((x) => x !== id) : [...disabled, id])}
+            />
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -659,10 +732,16 @@ const SMART_KEYS = editorPage({
           label: 'Use "CamelHumps" words',
           hint: "⌥← / ⌥→ and ⌥⌫ stop at humps of camelCase names.",
         },
-        { t: "check", key: `${P}.smartKeys.pairBrackets`, label: "Insert paired brackets (), [], {}" },
+        {
+          t: "check",
+          key: `${P}.smartKeys.pairBrackets`,
+          label: "Insert paired brackets (), [], {}",
+          hint: "Also pairs <> for generics where the syntax says a type starts.",
+        },
         { t: "check", key: `${P}.smartKeys.pairQuotes`, label: "Insert pair quote" },
         { t: "check", key: `${P}.smartKeys.surroundSelection`, label: "Surround selection on typing quote or brace" },
         { t: "check", key: `${P}.smartKeys.tabOutOfPair`, label: "Jump outside closing bracket/quote with Tab" },
+        { t: "check", key: `${P}.smartKeys.simultaneousTagEditing`, label: "Simultaneous <tag></tag> editing" },
         {
           t: "select",
           key: `${P}.smartKeys.reformatOnPaste`,
@@ -673,11 +752,19 @@ const SMART_KEYS = editorPage({
             { value: "indentEachLine", label: "Indent Each Line" },
           ],
         },
+        {
+          t: "check",
+          key: `${P}.smartKeys.escapeOnPaste`,
+          label: "Escape text on paste in string literals",
+        },
       ],
     },
     {
       title: "Enter",
-      items: [{ t: "check", key: `${P}.smartKeys.smartIndent`, label: "Smart indent" }],
+      items: [
+        { t: "check", key: `${P}.smartKeys.smartIndent`, label: "Smart indent" },
+        { t: "check", key: `${P}.smartKeys.insertDocStub`, label: "Insert documentation comment stub" },
+      ],
     },
     {
       title: "Backspace",
@@ -812,18 +899,55 @@ const INLAY: Item[] = [
   },
 ];
 
+const CODE_VISION_POSITIONS = [
+  { value: "top", label: "Top" },
+  { value: "right", label: "Right" },
+];
+
 const INLAY_HINTS = editorPage({
   id: "editor.inlayHints",
   title: "Inlay Hints",
   order: 33,
-  keywords: ["hints", "code vision", "usages", "parameter hints", "type hints"],
+  keywords: ["hints", "code vision", "code lens", "usages", "code author", "parameter hints", "type hints"],
   sections: [
     { items: INLAY },
     {
       title: "Code Vision",
       items: [
-        { t: "check", key: `${P}.inlay.codeVisionUsages`, label: "Usages" },
-        { t: "check", key: `${P}.inlay.codeVisionAuthor`, label: "Code author" },
+        {
+          t: "check",
+          key: `${P}.inlay.codeVision`,
+          label: "Show Code Vision",
+          children: [
+            {
+              t: "check",
+              key: `${P}.inlay.codeVisionUsages`,
+              label: "Usages",
+              children: [
+                {
+                  t: "select",
+                  key: `${P}.inlay.codeVisionUsagesPosition`,
+                  label: "Position",
+                  options: CODE_VISION_POSITIONS,
+                },
+                { t: "check", key: `${P}.inlay.codeVisionNoUsages`, label: "Show “no usages”" },
+              ],
+            },
+            {
+              t: "check",
+              key: `${P}.inlay.codeVisionAuthor`,
+              label: "Code author",
+              children: [
+                {
+                  t: "select",
+                  key: `${P}.inlay.codeVisionAuthorPosition`,
+                  label: "Position",
+                  options: CODE_VISION_POSITIONS,
+                },
+              ],
+            },
+          ],
+        },
       ],
     },
     { title: "Languages", items: [{ t: "custom", label: "Show inlay hints for:", component: InlayLanguages }] },

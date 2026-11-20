@@ -1,13 +1,13 @@
-import { focusRepo } from "./store";
 /**
  * Actions of the Git Log's inner panes: the Branches pane toolbar, Graph Options'
  * linear-branch actions and the changed-files pane (toolbar and context menu).
  */
 import { create } from "zustand";
 import type { Branch } from "@/bindings";
-import { registerActions, type Action } from "@/platform/actions";
+import { executeAction, registerActions, type Action } from "@/platform/actions";
+import { relativePath } from "@/platform/project";
 import { notifications, toolWindowService } from "@/workbench/contributions";
-import { deleteBranch, deleteRemoteBranch, newBranch, toggleFavoriteBranch, updateBranch } from "./branchOps";
+import { deleteBranches, newBranch, toggleFavoriteBranch, updateBranches } from "./branchOps";
 import {
   changesArg,
   compareChangeWithLocal,
@@ -18,10 +18,44 @@ import {
   useLogChanges,
 } from "./logChanges";
 import { logOptions } from "./logOptions";
-import { goToRef, updateLogOptions } from "./logStore";
+import { goToRef, selectedCommits, updateLogOptions, useGitLog } from "./logStore";
+import { commitKey, commitRepo } from "./multiRoot";
+import { currentRepoRoot, focusRepo } from "./store";
 
 const VCS = "vcsAvailable";
 const LOG = "vcsAvailable || projectOpen || vcsLogFocus";
+
+function showFocusedHistoryDiff() {
+  const selected = selectedCommits();
+  if (selected.length === 2) {
+    void executeAction("vcs.log.compareVersions");
+    return;
+  }
+  if (selected.length !== 1) return;
+
+  const state = useGitLog.getState();
+  const tab = state.logTabs.find((item) => item.id === state.shownLog);
+  if (tab?.kind !== "history") return;
+
+  const commit = selected[0]!;
+  const changes = useLogChanges.getState();
+  // The details pane loads asynchronously after a row selection. Never diff a stale pane.
+  if (changes.commits.length !== 1 || commitKey(changes.commits[0]!) !== commitKey(commit)) {
+    notifications().notify({ group: "vcs", level: "info", title: "Revision changes are still loading" });
+    return;
+  }
+
+  const root = commitRepo(commit) ?? currentRepoRoot();
+  const targetPath = root ? relativePath(root, tab.target) : tab.target;
+  const historyPath = "historyPath" in commit && typeof commit.historyPath === "string" ? commit.historyPath : null;
+  const relevant = changes.all.filter(
+    (change) =>
+      change.path === targetPath ||
+      change.oldPath === targetPath ||
+      (historyPath !== null && (change.path === historyPath || change.oldPath === historyPath)),
+  );
+  if (relevant.length) void showChangesDiff(relevant, false, relevant);
+}
 
 /** A ref selected in the Branches pane. */
 export interface BranchTarget {
@@ -38,6 +72,13 @@ function branchArg(arg: unknown): BranchTarget | null {
   return useBranchesPane.getState().selected[0] ?? null;
 }
 
+/** The action's branches: an array argument as a whole, otherwise the single one or the pane's selection. */
+function branchTargets(arg: unknown): BranchTarget[] {
+  if (Array.isArray(arg)) return arg.filter((t): t is BranchTarget => !!t && typeof t === "object" && "ref" in t);
+  if (arg && typeof arg === "object" && "ref" in arg) return [arg as BranchTarget];
+  return useBranchesPane.getState().selected;
+}
+
 const withBranch =
   (fn: (b: Branch) => unknown): Action["run"] =>
   async ({ arg }) => {
@@ -46,11 +87,6 @@ const withBranch =
     const b = target?.branch;
     if (b) void fn(b);
   };
-
-/** Delete is offered for branches other than the current one. */
-export function canDeleteBranch(t: BranchTarget | null): boolean {
-  return !!t?.branch && !t.branch.current;
-}
 
 /** Update fast-forwards a local branch with an upstream (or updates the project for the current one). */
 export function canUpdateBranch(t: BranchTarget | null): boolean {
@@ -108,7 +144,7 @@ export function registerLogPaneActions(): () => void {
       icon: "git-pull",
       when: VCS,
       hidden: true,
-      run: withBranch((b) => updateBranch(b.name)),
+      run: ({ arg }) => updateBranches(branchTargets(arg)),
     },
     {
       id: "vcs.log.branches.delete",
@@ -117,10 +153,7 @@ export function registerLogPaneActions(): () => void {
       icon: "trash",
       when: VCS,
       hidden: true,
-      run: withBranch((b) => {
-        if (b.current) return;
-        return b.remote ? deleteRemoteBranch(b.name) : deleteBranch(b.name);
-      }),
+      run: ({ arg }) => deleteBranches(branchTargets(arg)),
     },
     {
       id: "vcs.log.branches.toggleFavorite",
@@ -153,7 +186,14 @@ export function registerLogPaneActions(): () => void {
       icon: "diff",
       when: LOG,
       hidden: true,
-      run: ({ arg }) => void showChangesDiff(changesArg(arg)),
+      keyWhen: "vcsLogChangesFocus || vcsLogRevisionFocus",
+      run: ({ arg, ctx }) => {
+        if (ctx.vcsLogRevisionFocus) {
+          showFocusedHistoryDiff();
+          return;
+        }
+        void showChangesDiff(changesArg(arg));
+      },
     },
     {
       id: "vcs.log.changes.compareWithLocal",

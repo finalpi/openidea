@@ -15,7 +15,7 @@
 .search {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
   height: var(--h-list-row);
   margin: 0 6px 4px;
   padding: 0 8px;
@@ -31,7 +31,7 @@
 .row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   min-height: var(--h-list-row);
   margin: 0 6px;
   padding: 0 8px;
@@ -68,6 +68,16 @@
   font-size: var(--fs-small);
   font-weight: 600;
 }
+.groupHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  padding: 6px 16px 2px;
+  color: var(--fg);
+  font-weight: 600;
+  white-space: nowrap;
+  --icon-color: var(--fg-muted);
+}
 .badge {
   align-self: flex-start;
   margin-top: 1px;
@@ -77,7 +87,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-0-5);
 }
 .top {
   display: flex;
@@ -88,6 +98,10 @@
 .name {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* A recent project whose folder is gone. */
+.name.unavailable {
+  color: var(--fg-subtle);
 }
 .branch {
   display: inline-flex;

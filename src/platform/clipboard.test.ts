@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { commands } from "./ipc";
-import { pasteClipboardFiles, readClipboardText } from "./clipboard";
+import { pasteClipboardFiles, readClipboardPng, readClipboardText, writeClipboardText } from "./clipboard";
 
 beforeEach(() => vi.stubGlobal("__TAURI_INTERNALS__", {}));
 afterEach(() => {
@@ -58,5 +58,64 @@ describe("clipboard text", () => {
     event.preventDefault();
     expect(pasteClipboardFiles(event, paste)).toBe(false);
     expect(paste).not.toHaveBeenCalled();
+  });
+});
+
+describe("clipboard writes", () => {
+  it.each(["com.acme.A#run", "/p/src/A.java:5", "中文\n😀", ""])(
+    "writes %j natively without browser activation",
+    async (text) => {
+      const native = vi.spyOn(commands, "clipboardWriteText").mockResolvedValue({ status: "ok", data: null });
+      const browser = vi
+        .fn()
+        .mockRejectedValue(
+          new DOMException(
+            "The request is not allowed by the user agent or the platform in the current context",
+            "NotAllowedError",
+          ),
+        );
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: browser } });
+      await Promise.resolve();
+      await writeClipboardText(text);
+      expect(native).toHaveBeenCalledExactlyOnceWith(text);
+      expect(browser).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reports native errors instead of claiming success", async () => {
+    vi.spyOn(commands, "clipboardWriteText").mockResolvedValue({
+      status: "error",
+      error: { kind: "internal", message: "busy", data: null },
+    });
+    await expect(writeClipboardText("text")).rejects.toThrow("busy");
+  });
+
+  it("uses the browser clipboard outside Tauri", async () => {
+    vi.unstubAllGlobals();
+    const native = vi.spyOn(commands, "clipboardWriteText");
+    const browser = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: browser } });
+    await writeClipboardText("web preview");
+    expect(browser).toHaveBeenCalledExactlyOnceWith("web preview");
+    expect(native).not.toHaveBeenCalled();
+  });
+});
+
+describe("clipboard image", () => {
+  it("is the PNG's base64, without the data URL prefix", async () => {
+    const image = vi.spyOn(commands, "clipboardImage");
+    image.mockResolvedValue({ status: "ok", data: "data:image/png;base64,iVBORw0KGgo=" });
+    expect(await readClipboardPng()).toBe("iVBORw0KGgo=");
+    image.mockResolvedValue({ status: "ok", data: null });
+    expect(await readClipboardPng()).toBeNull();
+    image.mockRejectedValue(new Error("busy"));
+    await expect(readClipboardPng()).rejects.toThrow("busy");
+  });
+
+  it("is none outside the desktop app", async () => {
+    vi.unstubAllGlobals();
+    const image = vi.spyOn(commands, "clipboardImage");
+    expect(await readClipboardPng()).toBeNull();
+    expect(image).not.toHaveBeenCalled();
   });
 });

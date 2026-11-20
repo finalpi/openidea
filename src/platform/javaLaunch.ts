@@ -4,9 +4,18 @@
  * `${classpath}` (or `${testClasspath}`) and the `java` launcher are resolved
  * through jdtls when the configuration starts.
  */
-import { call, commands, IpcError, type JavaLaunchInfo, type RunConfig, type RequestId } from "@/platform/ipc";
+import {
+  call,
+  commands,
+  IpcError,
+  type BuildPolicy,
+  type JavaLaunchInfo,
+  type RunConfig,
+  type RequestId,
+} from "@/platform/ipc";
 import { tx } from "@/platform/i18n";
 import { useBuildPresentation } from "@/platform/projectPresentation";
+import { isRemoteWindow } from "@/platform/remote";
 
 export const CLASSPATH = "${classpath}";
 export const TEST_CLASSPATH = "${testClasspath}";
@@ -15,6 +24,25 @@ export const JVM_APPLICATION_KINDS = ["application", "spring-boot"];
 
 export function isJvmApplication(config: Pick<RunConfig, "kind">): boolean {
   return JVM_APPLICATION_KINDS.includes(config.kind);
+}
+
+/** Run configuration kinds whose JVM gets the plugins' Java agents (`[[contributes.javaAgents]]`). */
+const JAVA_AGENT_KINDS = ["application", "spring-boot", "jar-application"];
+
+/**
+ * The console line of a Java launch in a remote project, when plugins with a granted
+ * `java.agent` would have added their agent: the JVM runs on the server, and agents load
+ * only into JVMs on this machine. `null` otherwise. Plugins are the desktop's own.
+ */
+export async function remoteJavaAgentNote(config: Pick<RunConfig, "kind">): Promise<string | null> {
+  if (!JAVA_AGENT_KINDS.includes(config.kind) || !isRemoteWindow()) return null;
+  const snapshot = await call(commands.pluginList()).catch(() => null);
+  const names = (snapshot?.plugins ?? [])
+    .filter((p) => p.enabled && p.capabilities.some((c) => c.id === "java.agent" && c.granted))
+    .map((p) => p.name);
+  if (!names.length) return null;
+  const list = names.join(", ");
+  return tx`Java agents of ${list} were not added: they load only in local projects.` + "\n";
 }
 
 /** `java` options whose value is the next argument. */
@@ -38,6 +66,7 @@ export interface JavaCommandLine {
   /** VM options, without the classpath. */
   vmArgs: string[];
   mainClass: string | null;
+  jarPath?: string;
   programArgs: string[];
   /** Which classpath placeholder the configuration uses (`null`: an explicit classpath or none). */
   classpath: "runtime" | "test" | null;
@@ -52,6 +81,15 @@ export function parseJavaArgs(args: readonly string[]): JavaCommandLine {
   let explicitClasspath: string | null = null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
+    if (a === "-jar")
+      return {
+        vmArgs,
+        mainClass: null,
+        jarPath: args[i + 1],
+        programArgs: args.slice(i + 2),
+        classpath,
+        explicitClasspath,
+      };
     if (a === "-cp" || a === "-classpath" || a === "--class-path") {
       const value = args[++i] ?? "";
       if (value === CLASSPATH) classpath = "runtime";
@@ -110,6 +148,14 @@ export function joinJavaArgs(args: readonly string[]): string {
 
 /** JDWP agent options: listen on a free local port and wait for the debugger. */
 export const JDWP_AGENT = "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0";
+
+/** Makes a HotSpot JVM open its attach socket at start-up; the memory view finds the debuggee through it. */
+export const ATTACH_LISTENER = "-XX:+StartAttachListener";
+
+/** True when VM options already decide about the attach mechanism, so the IDE must not override them. */
+export function optsOutOfAttach(text: string): boolean {
+  return /StartAttachListener|DisableAttachMechanism/.test(text);
+}
 
 /** The port of `Listening for transport dt_socket at address: 5005` (JDWP's start-up line). */
 export function jdwpListeningPort(line: string): number | null {
@@ -170,25 +216,47 @@ export async function resolveJavaModule(config: RunConfig): Promise<string> {
   return module;
 }
 
+/** Saves before resolving the module, for direct and delegated Run and Debug. */
+export async function prepareJavaModule(config: RunConfig, saveAll?: () => Promise<void>, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  await saveAll?.();
+  signal?.throwIfAborted();
+  const module = await resolveJavaModule(config);
+  signal?.throwIfAborted();
+  return module;
+}
+
 /** Shared, cancellable build and classpath preparation for Run and Debug. */
 export interface JavaPreparation {
   request: RequestId;
   signal: AbortSignal;
   report?: (text: string, kind?: "system" | "stderr") => void;
+  /** Before launch build; unset reads the run configuration (default: automatic/incremental). */
+  policy?: BuildPolicy;
+  /** Saves open documents first, as IDEA's Before launch does. */
+  saveAll?: () => Promise<void>;
 }
+
+/** The build the launch would do: the configuration's policy, else incremental. */
+export function buildPolicyOf(config: RunConfig): BuildPolicy {
+  return config.buildPolicy ?? "automatic";
+}
+
+/** A build stopped the launch: the message is ready for the console and the notification. */
+export class JavaBuildFailedError extends Error {}
 
 export async function prepareJavaLaunch(config: RunConfig, preparation: JavaPreparation) {
   const { signal, report } = preparation;
+  const policy = preparation.policy ?? buildPolicyOf(config);
   signal.throwIfAborted();
   const parsed = parseJavaArgs(config.args);
   if (!parsed.mainClass) throw new Error(`No main class in '${config.name}'`);
   report?.(tx`Building and resolving the classpath of ${parsed.mainClass}…` + "\n");
   const started = performance.now();
-  const module = await resolveJavaModule(config);
-  signal.throwIfAborted();
+  const module = await prepareJavaModule(config, preparation.saveAll, signal);
   const moduleMs = performance.now() - started;
   const info = await call(
-    commands.javaResolveLaunch(module, parsed.classpath === "test", true, preparation.request),
+    commands.javaResolveLaunch(module, parsed.classpath === "test", policy, preparation.request),
   ).catch((error: unknown) => {
     if (
       error instanceof IpcError &&
@@ -204,11 +272,17 @@ export async function prepareJavaLaunch(config: RunConfig, preparation: JavaPrep
   });
   signal.throwIfAborted();
   console.info("Java launch preparation", { module, moduleMs, resolveMs: performance.now() - started - moduleMs });
-  if (info.build === "withErrors")
-    report?.(tx("Build completed with errors; launching with the last compiled classes.") + "\n", "stderr");
-  if (info.build === "failed") report?.(tx("Build failed; launching with the last compiled classes.") + "\n", "stderr");
   const errors = formatCompileErrors(info);
   if (errors) report?.(errors, "stderr");
+  // IDEA's default: a failed build (or one with compile errors) does not start the program;
+  // only "Build, no error check" continues with the last compiled classes.
+  if ((info.build === "failed" || info.build === "withErrors") && policy !== "makeAndContinueOnErrors") {
+    const reason =
+      info.build === "failed"
+        ? tx`Build failed; '${config.name}' was not started.`
+        : tx`Build has compile errors; '${config.name}' was not started.`;
+    throw new JavaBuildFailedError(reason);
+  }
   if (parsed.classpath && !info.classPaths.length)
     throw new Error(tx("The classpath is empty: is the module imported by the Java language server?"));
   return { module, info, resolved: resolveJavaCommand(config, info) };

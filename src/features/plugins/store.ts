@@ -1,5 +1,7 @@
 /** Installed plugins, their UI contributions, the selected plugin theme, and the operations on them. */
 import { create } from "zustand";
+import { tx } from "@/platform/i18n";
+import { isErrorKind } from "@/platform/ipc";
 import type {
   ActiveTheme,
   CapabilityInfo,
@@ -189,6 +191,11 @@ export function setPluginCapability(id: string, capability: string, granted: boo
   return withBusy(id, `Could not change ${capability} of ${nameOf(id)}`, () =>
     pluginsBackend().setCapability(id, capability, granted),
   );
+}
+
+export function revokePluginNetHost(id: string, host: string): Promise<boolean> {
+  const name = nameOf(id);
+  return withBusy(id, tx`Could not revoke ${host} for ${name}`, () => pluginsBackend().revokeNetHost(id, host));
 }
 
 export async function refreshCatalog(): Promise<void> {
@@ -396,18 +403,19 @@ export async function runPluginCommand(
   pluginId: string,
   commandId: string,
   arg: string | null = null,
+  paths: string[] = [],
   options: { reportErrors?: boolean } = {},
 ) {
   const title = commandTitle(pluginId, commandId);
   try {
-    return await pluginsBackend().runCommand(pluginId, commandId, arg, editorContext());
+    return await pluginsBackend().runCommand(pluginId, commandId, arg, editorContext(), paths);
   } catch (e) {
     await refreshPlugins();
     if (options.reportErrors === false) throw e;
     const status = usePlugins.getState().plugins.find((p) => p.id === pluginId)?.status;
     // A trap disables the plugin and the backend already announced why; a
     // consent request opens its own dialog.
-    const permission = (e as { kind?: string }).kind === "permissionDenied";
+    const permission = isErrorKind(e, "permissionDenied");
     if (status !== "failed" && !permission)
       notifications().notify({ group: "plugins", level: "error", title: `${title} failed`, body: errorText(e) });
     return null;

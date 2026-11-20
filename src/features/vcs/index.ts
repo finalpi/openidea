@@ -7,46 +7,55 @@ import { onWorkflowSettingsChange, workflowSettings } from "@/platform/workflowS
 import { editorsFor, registerEditorContribution } from "@/editor/api";
 import {
   notifications,
+  provideChangesViewSelection,
   registerEditorKind,
   registerMenuGroup,
   registerOverlay,
-  registerSettingsPage,
   registerTitleItem,
   registerToolWindow,
 } from "@/workbench/contributions";
-import { executeAction } from "@/platform/actions";
+import { executeAction, registerActions } from "@/platform/actions";
 import { getContext } from "@/platform/context";
 import { lazyComponent } from "@/ui";
-import { registerVcsActions } from "./actions";
+import { commitWindowFocused, registerVcsActions } from "./actions";
 import { installChangelists } from "./changelists";
 import { registerHistoryActions, trackOperationContext } from "./historyActions";
 import { registerLogPaneActions } from "./logPaneActions";
-import { controlLabel, controlOperation, inProgress } from "./operations";
+import { controlLabel, controlOperation, inProgress, installOperationNoticeExpiry } from "./operations";
 import { annotationsShown, blameSlot } from "./blame";
+import { activateRevisionAnnotations } from "./annotateRevisionProvider";
 import { inlineBlame } from "./inlineBlame";
-import { BranchWidget, useBranchesPopup } from "./BranchWidget";
-import { showConflictsDialog } from "./conflictsUi";
+import { BranchWidget, BranchesPopupHost, useBranchesPopup } from "./BranchWidget";
+import { SyncCommitsPopupHost } from "./SyncCommitsPopup";
+import { showConflictsDialog, takeContinueWhenResolved } from "./conflictsUi";
 import { registerCompareActions } from "./compare";
-import { DIFF_KIND, diffTitle, type DiffData } from "./diffInput";
+import { activateDiffViewer } from "./diffViewer";
+import { installDiffEditorHost } from "./DiffWindow";
 import { VcsDialogHost } from "./dialogs";
 import { changeMarkers } from "./gutter";
 import { installHunkPopup } from "./HunkPopup";
 import { LOCAL_HISTORY_KIND } from "./localHistoryKind";
+import { DIRECTORY_COMPARE_KIND, directoryCompareTitle, type DirectoryCompareData } from "./directoryCompareKind";
 import { SELECTION_HISTORY_KIND, type SelectionHistoryData } from "./selectionHistoryKind";
 import { registerLocalHistoryActions } from "./localHistoryActions";
 import { MERGE_KIND, type MergeData } from "./mergeKind";
 import { registerMergeActions } from "./mergeActions";
-import { baseName } from "./model";
-import { installDiagnosticsTracking } from "./commitChecks";
+import { baseName, stripSlash } from "./model";
+import { installCommitChecks, installDiagnosticsTracking } from "./commitChecks";
 import { installPreparedMessage, useCommit } from "./commitStore";
+import { installDraftRevision, provideCommit } from "./commitSelection";
 import { activate as activateConflictBanner } from "./conflictBanner";
 import { activate as activateConflictMarkers } from "./conflictMarkers";
 import { MergeRebaseWidget } from "./MergeRebaseWidget";
 import { installFileConfirmations } from "./confirmations";
 import { installIncomingCheck } from "./incoming";
 import { closeLogTab, installGitLog, selectGitTab, useGitLog } from "./logStore";
-import { installVcsStore, onConflictsAppeared, onConflictsCleared, useVcs } from "./store";
+import { existsOnDisk, installVcsStore, onConflictsAppeared, onConflictsCleared, useVcs } from "./store";
+import { installRootSync } from "./rootSync";
 import { tx } from "@/platform/i18n";
+import { openOnRemoteActions, registerOpenOnRemote } from "./openOnRemote";
+import { copyRepositoryPathActions, registerCopyRepositoryPath } from "./copyRepositoryPath";
+import { activateSettingsPages } from "./settingsPages";
 
 /** The Resolve/Continue/Abort buttons exist in the title bar only while there is something to resolve. */
 function trackMergeRebaseItem(): () => void {
@@ -147,30 +156,6 @@ function conflictsBody(names: string[]): string {
     : tx`${names.length} files have conflicts: ${list}`;
 }
 
-/** Settings › Version Control › Log (also used by the Settings window). */
-export { activateComparisonWindow, ComparisonWindow } from "./ComparisonWindow";
-
-/** The diff viewer (editor kind `diff`), also for windows that show diffs without Git (deployment). */
-export function activateDiffViewer(): () => void {
-  return registerEditorKind({
-    kind: DIFF_KIND,
-    standalone: true,
-    component: lazyComponent(() => import("./diff-editor-tab").then((m) => m.DiffEditorTab)),
-    title: (input) => diffTitle(input.data as DiffData),
-    icon: () => "diff",
-  });
-}
-
-export function activateSettingsPages(): () => void {
-  return registerSettingsPage({
-    id: "vcs.log",
-    title: "Log",
-    order: 6,
-    keywords: ["git log", "references", "tags", "columns", "commit time"],
-    component: lazyComponent(() => import("./LogSettingsPage").then((m) => m.LogSettingsPage)),
-  });
-}
-
 export function activate(): () => void {
   onConflictsAppeared((files) =>
     notifications().notify({
@@ -186,8 +171,13 @@ export function activate(): () => void {
 
   onConflictsCleared(() => {
     notifications().expire?.("vcs.conflicts");
-    // As IDEA does once the last conflict is resolved: offer to continue the stopped operation.
     const op = inProgress();
+    // Resolved from the Conflicts dialog: the stopped rebase / cherry-pick goes on by itself.
+    if (op && takeContinueWhenResolved() === op) {
+      void controlOperation("continue", op);
+      return;
+    }
+    // Otherwise, as IDEA does once the last conflict is resolved: offer to continue it.
     if (op)
       notifications().notify({
         group: "vcs",
@@ -207,17 +197,42 @@ export function activate(): () => void {
   useCommit.setState({ signOff: workflowSettings().vcs.git.signOff });
   const disposers = [
     installVcsStore(),
+    installOperationNoticeExpiry(),
+    installRootSync(),
     installGitLog(),
     installDiagnosticsTracking(),
+    installCommitChecks(),
     installPreparedMessage(),
+    installDraftRevision(),
+    provideCommit(),
+    // Deployment shortcuts (and similar) use this while Commit / Local Changes is focused.
+    provideChangesViewSelection(() => {
+      if (!commitWindowFocused()) return [];
+      // As the context menu: deleted files have nothing to upload.
+      const deleted = new Set(
+        useVcs
+          .getState()
+          .status.filter((f) => !existsOnDisk(f))
+          .map((f) => f.path),
+      );
+      return useCommit
+        .getState()
+        .selection.filter((p) => !deleted.has(p))
+        .map(stripSlash);
+    }),
     installIncomingCheck(),
     installFileConfirmations(),
+    installDiffEditorHost(),
     // Settings › Git › Sign-off commit: the default of Commit Options › Sign-off Commit.
     onWorkflowSettingsChange(
       (w) => w.vcs.git.signOff,
       (signOff) => useCommit.setState({ signOff }),
     ),
     registerVcsActions(),
+    registerActions(openOnRemoteActions),
+    registerOpenOnRemote(),
+    registerActions(copyRepositoryPathActions),
+    registerCopyRepositoryPath(),
     registerHistoryActions(),
     registerLogPaneActions(),
     activateSettingsPages(),
@@ -230,6 +245,8 @@ export function activate(): () => void {
     trackMergeRebaseItem(),
     installHunkPopup(),
     registerOverlay({ id: "vcs.dialogs", component: VcsDialogHost }),
+    registerOverlay({ id: "vcs.branches", component: BranchesPopupHost }),
+    registerOverlay({ id: "vcs.syncCommits", component: SyncCommitsPopupHost }),
     activateConflictBanner(),
     activateConflictMarkers(),
     trackCommitWindow(),
@@ -271,11 +288,19 @@ export function activate(): () => void {
       restorable: true,
     }),
     activateDiffViewer(),
+    activateRevisionAnnotations(),
     registerEditorKind({
       kind: MERGE_KIND,
       component: lazyComponent(() => import("./MergeEditor").then((m) => m.MergeEditor)),
       title: (input) => `Merge: ${baseName((input.data as MergeData).path)}`,
       icon: () => "branch",
+    }),
+    registerEditorKind({
+      kind: DIRECTORY_COMPARE_KIND,
+      component: lazyComponent(() => import("./DirectoryCompare").then((m) => m.DirectoryCompareEditor)),
+      title: (input) => directoryCompareTitle(input.data as DirectoryCompareData),
+      icon: () => "diff",
+      restorable: true,
     }),
     registerEditorKind({
       kind: LOCAL_HISTORY_KIND,

@@ -5,6 +5,7 @@
  * offers to disable hints of that kind.
  */
 import { StateEffect, StateField, type Extension } from "@codemirror/state";
+import { shownAgain } from "@/editor/api";
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import { call, commands, isTauri, type InlayHint } from "@/platform/ipc";
 import { executeAction } from "@/platform/actions";
@@ -15,7 +16,7 @@ import { useProject } from "@/platform/project";
 import { editorPrefs } from "@/platform/editorSettings";
 import { debounce, docOf, isUnavailable, lspRequest } from "./lsp";
 import { offsetsToRange, posToOffset } from "./positions";
-import { featureBackoff, onLspRefresh } from "./availability";
+import { featureBackoff, onLspRefresh, onServerSettled, anyServerBusy } from "./availability";
 import { gotoTargets } from "./navigation";
 import { tx } from "@/platform/i18n";
 
@@ -158,10 +159,13 @@ function shownKind(kind: InlayHint["kind"]): boolean {
 
 const inlayPlugin = ViewPlugin.fromClass(
   class {
-    private refresh = debounce(() => void this.run(), 400);
+    private generation = 0;
+    private schedule = debounce(() => void this.run(), 400);
     private unsubscribe: () => void;
     private offReady: () => void;
+    private offSettled: () => void;
     private offModifier: () => void;
+    private skipped = false;
     constructor(private view: EditorView) {
       this.refresh();
       view.contentDOM.classList.toggle("cm-lsp-navigation-modifier", navigationModifierHeld());
@@ -176,42 +180,65 @@ const inlayPlugin = ViewPlugin.fromClass(
           this.refresh();
       });
       this.offReady = onLspRefresh("inlayHints", () => this.refresh());
+      // Answers given while the server was busy may have been partial; ask again once it settles.
+      this.offSettled = onServerSettled(() => this.refresh());
     }
     update(u: ViewUpdate) {
-      if (u.docChanged || u.viewportChanged) this.refresh();
+      if (u.docChanged || u.viewportChanged || (this.skipped && shownAgain(u))) this.refresh();
+    }
+    private refresh() {
+      this.generation++;
+      this.schedule();
     }
     async run() {
       const view = this.view;
-      if (!view.dom.isConnected) return;
+      this.skipped = !view.dom.isConnected;
+      if (this.skipped) return;
       const doc = docOf(view);
       if (!doc) return;
-      if (!enabled(doc.language) || inlayBackoff.active(doc.doc)) {
+      if (!enabled(doc.language)) {
         if (view.state.field(inlayField).size) view.dispatch({ effects: setInlays.of(Decoration.none) });
         return;
       }
+      // The server is unavailable. While a server is starting or busy (a restart), keep the
+      // hints shown — they map through edits, and the settled refresh re-queries — instead of
+      // wiping them on every pass; a server that stays down takes its hints with it.
+      if (inlayBackoff.active(doc.doc)) {
+        if (!anyServerBusy() && view.state.field(inlayField).size)
+          view.dispatch({ effects: setInlays.of(Decoration.none) });
+        return;
+      }
       const state = view.state;
+      const generation = this.generation;
+      const wanted = () => generation === this.generation && view.state.doc === state.doc;
       const { from, to } = view.viewport;
       const first = state.doc.lineAt(from).from;
       const last = state.doc.lineAt(to).to;
       try {
-        const hints = await lspRequest(() => commands.lspInlayHints(doc.doc, offsetsToRange(state.doc, first, last)));
-        if (view.state.doc !== state.doc) return this.refresh();
+        const hints = await lspRequest(
+          () => commands.lspInlayHints(doc.doc, offsetsToRange(state.doc, first, last)),
+          wanted,
+        );
+        if (!wanted()) return;
+        const fresh = hints.filter((h) => shownKind(h.kind));
+        // A busy server (indexing, loading a build) can answer with nothing: keep the
+        // hints shown until it settles, instead of blinking them away and reflowing
+        // text. A partial non-empty answer is applied as-is: a subset of hints given
+        // mid-spell is trusted until the settled refresh that follows replaces it.
+        if (!fresh.length && view.state.field(inlayField).size && anyServerBusy()) return;
         view.dispatch({
-          effects: setInlays.of(
-            inlayDecorations(
-              view,
-              hints.filter((h) => shownKind(h.kind)),
-            ),
-          ),
+          effects: setInlays.of(inlayDecorations(view, fresh)),
         });
       } catch (e) {
-        if (isUnavailable(e)) inlayBackoff.mark(doc.doc);
+        if (wanted() && isUnavailable(e)) inlayBackoff.mark(doc.doc);
       }
     }
     destroy() {
-      this.refresh.cancel();
+      this.generation++;
+      this.schedule.cancel();
       this.unsubscribe();
       this.offReady();
+      this.offSettled();
       this.offModifier();
       this.view.contentDOM.classList.remove("cm-lsp-navigation-modifier");
     }

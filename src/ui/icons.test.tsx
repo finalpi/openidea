@@ -11,6 +11,7 @@ import {
   fileIconName,
   hasIcon,
   iconMarkup,
+  isIconName,
   iconMarkupOrFallback,
   registerExternalIcons,
   setFileIconTheme,
@@ -52,6 +53,14 @@ describe("tool window icons", () => {
 describe("Icon", () => {
   it("resolves every name to an SVG asset", () => {
     for (const name of ICON_NAMES) expect(iconMarkup(name), name).toMatch(/^<svg/);
+  });
+
+  it("rejects inherited object keys as icon names", () => {
+    for (const name of ["__proto__", "constructor", "toString", "symbol-__proto__", "symbol-toString"]) {
+      expect(isIconName(name), name).toBe(false);
+      expect(iconMarkup(name), name).toBeNull();
+    }
+    expect(isIconName("symbol-constructor")).toBe(true);
   });
 
   it("falls back like <Icon> for unknown names, without React", () => {
@@ -272,6 +281,33 @@ describe("fileIconName", () => {
       const markup = iconMarkup(name)!.replace(/\bm\d+-/g, "");
       expect(seen.get(markup), name).toBeUndefined();
       seen.set(markup, name);
+    }
+  });
+});
+
+describe("image icons", () => {
+  const png =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
+  it("renders a raster data URI as an image of the icon's size", () => {
+    const { container } = render(<Icon name={png} size={14} />);
+    const img = container.querySelector("img")!;
+    expect(img.getAttribute("src")).toBe(png);
+    expect([img.width, img.height]).toEqual([14, 14]);
+    expect(container.querySelector("svg")).toBeNull();
+  });
+
+  it("falls back to the file icon for other URIs and oversized images", () => {
+    for (const name of [
+      "https://example.com/avatar.png",
+      "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+      `data:image/png;base64,${"A".repeat(70 * 1024)}`,
+      "data:image/png;base64,not base64!",
+    ]) {
+      const { container, unmount } = render(<Icon name={name} />);
+      expect(container.querySelector("img")).toBeNull();
+      expect(container.querySelector("svg")).toBeTruthy();
+      unmount();
     }
   });
 });

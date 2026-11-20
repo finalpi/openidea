@@ -1,15 +1,28 @@
 /** Lazy variables tree (scopes, locals, watches, evaluation results). */
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { writeClipboardText } from "@/platform/clipboard";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import clsx from "clsx";
 import { call, commands, type DebugSessionId, type Variable } from "@/platform/ipc";
-import { Icon, Tree, acquirePopup, showContextMenu, type MenuItem, type TreeHandle } from "@/ui";
+import { Dialog, Icon, Tree, acquirePopup, showContextMenu, type MenuItem, type TreeHandle } from "@/ui";
+import { formatMessage, tx } from "@/platform/i18n";
 import { activeEditor } from "@/editor/api";
 import { notifications } from "@/workbench/contributions";
 import { addFieldWatchpoint } from "../breakpoints/special";
 import { methodAt } from "../breakpoints/symbols";
-import { activeSession, addWatch, removeWatch, revealFrame, sessionSupports, setVariableValue } from "../state";
+import {
+  activeSession,
+  addWatch,
+  evaluate,
+  removeAllWatches,
+  removeWatch,
+  revealFrame,
+  sessionSupports,
+  setVariableValue,
+  useDebug,
+} from "../state";
 import { blurDebugView, focusDebugView } from "./focusedView";
-import { classifyValue, oneLine, sortVariables } from "../values";
+import { classifyValue, oneLine, shownValue, sortVariables } from "../values";
+import { stringText, valueText } from "../valueText";
 import { workflowSettings } from "@/platform/workflowSettings";
 import styles from "./VariablesView.module.css";
 
@@ -229,6 +242,7 @@ export function VariablesView({
   }, [byKey, expanded, children, load]);
 
   const [editing, setEditing] = useState<{ key: string; value: string; error: string | null } | null>(null);
+  const [valuePopup, setValuePopup] = useState<VarNode | null>(null);
   const editable = (n: VarNode | undefined): n is VarNode =>
     !!n && session != null && (n.kind === "var" || n.kind === "watch") && (n.container > 0 || !!n.evaluateName);
   const startEdit = (n: VarNode) => setEditing({ key: n.key, value: n.value, error: null });
@@ -268,6 +282,32 @@ export function VariablesView({
   const canWatch = (n: VarNode) =>
     session != null && n.kind === "var" && n.container > 0 && sessionSupports("dataBreakpoints");
 
+  const copyValue = async (node: VarNode) => {
+    let text = node.value;
+    const paused = session != null ? useDebug.getState().sessions[session] : undefined;
+    if (paused?.status === "paused" && node.reference <= 0 && node.evaluateName) {
+      // A long string arrives cut short; evaluating it for the clipboard returns all of it.
+      text = await evaluate(node.evaluateName, "clipboard", paused).then(
+        (v) => v.value || text,
+        () => text,
+      );
+    } else if (session != null && node.reference > 0) {
+      try {
+        text = await valueText(node, (ref) => call(commands.debugVariables(session, ref)));
+      } catch (e) {
+        notifications().notify({
+          group: "run",
+          level: "error",
+          key: "debug.copyValue",
+          title: "Cannot copy the value",
+          body: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
+    }
+    await writeClipboardText(text);
+  };
+
   const onContextMenu = (node: VarNode | null, _sel: Set<string>, e: React.MouseEvent) => {
     if (!node || node.kind === "message") return;
     e.preventDefault();
@@ -277,10 +317,14 @@ export function VariablesView({
         { label: "Set Value…", icon: "edit", shortcut: "F2", run: () => startEdit(node) },
         { kind: "separator" },
       );
-    if (node.kind === "watch") items.push({ label: "Remove Watch", icon: "minus", run: () => removeWatch(node.name) });
+    if (node.kind === "watch")
+      items.push(
+        { label: "Remove Watch", icon: "minus", run: () => removeWatch(node.name) },
+        { label: "Remove All Watches", run: removeAllWatches },
+      );
     if (node.kind !== "scope") {
-      items.push({ label: "Copy Value", icon: "copy", run: () => void navigator.clipboard?.writeText(node.value) });
-      items.push({ label: "Copy Name", run: () => void navigator.clipboard?.writeText(node.name) });
+      items.push({ label: "Copy Value", icon: "copy", run: () => void copyValue(node) });
+      items.push({ label: "Copy Name", run: () => void writeClipboardText(node.name) });
       if (node.kind === "var" && node.evaluateName)
         items.push({ label: "Add to Watches", icon: "eye", run: () => addWatch(node.evaluateName!) });
       if (canWatch(node))
@@ -344,11 +388,60 @@ export function VariablesView({
               }}
             />
           ) : (
-            <VarRow node={n} changed={isChanged(n)} />
+            <VarRow node={n} changed={isChanged(n)} onShowValue={setValuePopup} />
           )
         }
       />
+      {valuePopup && <ValueDialog node={valuePopup} session={session} onClose={() => setValuePopup(null)} />}
     </div>
+  );
+}
+
+/**
+ * View: the whole value in a popup that a click outside closes. Adapters cut long strings
+ * short in variables; the value is evaluated again as for copying (`clipboard`), which
+ * returns it in full, and a string shows as its text, line breaks included.
+ */
+function ValueDialog({
+  node,
+  session,
+  onClose,
+}: {
+  node: VarNode;
+  session: DebugSessionId | null;
+  onClose: () => void;
+}) {
+  const [value, setValue] = useState(node.value);
+  useEffect(() => {
+    const s = session != null ? useDebug.getState().sessions[session] : undefined;
+    if (!s || s.status !== "paused" || !node.evaluateName || node.reference > 0) return;
+    let live = true;
+    evaluate(node.evaluateName, "clipboard", s).then(
+      (v) => live && v.value && setValue(v.value),
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [node, session]);
+  const text = classifyValue(value, node.typeName) === "string" ? stringText(value) : value;
+  return (
+    <Dialog
+      open
+      popup
+      dismissOnBackdrop
+      onClose={onClose}
+      title={`${node.name}${node.typeName ? ` {${node.typeName}}` : ""}`}
+      width={720}
+      minHeight={260}
+      maxHeight={560}
+      resizable="both"
+      aria-label={formatMessage(tx("Value of {label}"), { label: node.name })}
+    >
+      <div className={styles.valuePopupContent}>
+        <pre className={styles.valuePopupValue}>{text}</pre>
+      </div>
+    </Dialog>
   );
 }
 
@@ -372,7 +465,9 @@ function VarEditRow({
   useEffect(() => acquirePopup(), []);
   return (
     <span className={styles.row}>
-      <span className={styles.name}>{node.name}</span>
+      <span className={styles.name} title={node.name}>
+        {node.name}
+      </span>
       <span className={styles.eq}>=</span>
       <input
         className={clsx(styles.editInput, error && styles.editInvalid)}
@@ -410,7 +505,33 @@ function nodeIcon(node: VarNode): string {
   return node.depth0 ? "variable" : "field";
 }
 
-function VarRow({ node, changed }: { node: VarNode; changed: boolean }) {
+function VarRow({
+  node,
+  changed,
+  onShowValue,
+}: {
+  node: VarNode;
+  changed: boolean;
+  onShowValue: (node: VarNode) => void;
+}) {
+  const valueRef = useRef<HTMLSpanElement>(null);
+  const [overflow, setOverflow] = useState(false);
+  useLayoutEffect(() => {
+    const text = valueRef.current;
+    const group = text?.parentElement;
+    if (!text || !group) {
+      setOverflow(false);
+      return;
+    }
+    // The group measures the space available before the Show button takes any of it.
+    const update = () => setOverflow(text.scrollWidth > group.clientWidth + 1);
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(group);
+    observer.observe(text);
+    return () => observer.disconnect();
+  }, [node.value, node.typeName, node.error]);
   if (node.kind === "message") return <span className={styles.message}>{node.name}</span>;
   if (node.kind === "scope")
     return (
@@ -420,19 +541,54 @@ function VarRow({ node, changed }: { node: VarNode; changed: boolean }) {
       </span>
     );
   const kind = node.error ? null : classifyValue(node.value, node.typeName);
+  const shown = shownValue(node.value, node.typeName);
+  const evaluation = node.kind === "eval";
   return (
-    <span className={styles.row}>
+    <span className={styles.row} title={node.name}>
       <Icon name={nodeIcon(node)} size={16} className={styles.nodeIcon} />
-      <span className={clsx(styles.name, node.kind === "var" && styles.varName, changed && styles.changed)}>
-        {node.name}
-      </span>
-      <span className={styles.eq}>=</span>
+      {!shown.entry && (
+        <>
+          <span
+            className={clsx(
+              styles.name,
+              evaluation && styles.evalName,
+              node.kind === "var" && styles.varName,
+              changed && styles.changed,
+            )}
+            title={evaluation ? node.name : undefined}
+          >
+            {evaluation ? oneLine(node.name) : node.name}
+          </span>
+          <span className={styles.eq}>=</span>
+        </>
+      )}
       {node.error ? (
         <span className={styles.error}>{oneLine(node.error)}</span>
       ) : (
         <>
-          {node.typeName && <span className={styles.type}>{`{${node.typeName}}`}</span>}
-          <span className={clsx(styles.value, kind && styles[kind])}>{oneLine(node.value)}</span>
+          {shown.label && (
+            <span className={styles.type} title={shown.label}>
+              {shown.label}
+            </span>
+          )}
+          <span className={styles.valueGroup}>
+            <span ref={valueRef} className={clsx(styles.value, kind && styles[kind])} title={node.value}>
+              {oneLine(shown.text)}
+            </span>
+            {overflow && (
+              <button
+                type="button"
+                className={styles.showValue}
+                title={tx("Show")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onShowValue(node);
+                }}
+              >
+                …{tx("Show")}
+              </button>
+            )}
+          </span>
         </>
       )}
     </span>

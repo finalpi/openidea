@@ -122,18 +122,46 @@ const CASES: Record<string, Case> = {
       file: "LibraryTest.kt",
     },
   },
+  php: {
+    fixture: "php-app",
+    setup: (root) =>
+      execFileSync("composer", ["install", "--no-interaction", "--no-progress"], { cwd: root, stdio: "ignore" }),
+    run: { config: "composer:quote", prints: "Bluebird Electronics: VAT $34.20, clearance fee $5.00" },
+    tests: {
+      config: "phpunit",
+      failing: (c) => env(c, { OPENIDEA_FAIL: "1" }),
+      passed: 13,
+      failed: "it intentionally fails (set OPENIDEA_FAIL=1)",
+      file: "ThresholdCustomsTest.php",
+    },
+  },
+  // The failing run uses the fixture's dedicated `test-failing` step (`zig build` forwards
+  // no args to the test binary, so a failing test can't be switched on through the config).
+  zig: {
+    fixture: "zig-app",
+    run: { config: "zig:run", prints: "Total: $134.97" },
+    tests: {
+      config: "zig:test-failing",
+      failing: (c) => c,
+      passed: 0,
+      failed: "intentionally fails",
+      file: "src/failing.zig",
+    },
+  },
 };
 
 let server: Server | null = null;
 let disconnect: (() => void) | null = null;
 let base = "";
 
-afterEach(() => {
+afterEach(async () => {
   // As switching projects does: run ids restart with each server.
   resetRuns();
   disconnect?.();
-  server?.close();
-  if (base) rmSync(base, { recursive: true, force: true });
+  await server?.close();
+  // A language server's own process (jdtls's JVM) can outlive the server's for a moment:
+  // deleting its data directory has to wait for it.
+  if (base) rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 1000 });
 });
 
 async function open(c: Case): Promise<string> {
@@ -200,7 +228,10 @@ async function smoke(language: string) {
   }
 
   // Tests, with the intentionally failing one switched on: one failure, located, the rest passed.
-  const { id, output } = await runToEnd(c.tests.failing(config(c.tests.config)));
+  // Switched on in the saved configuration, as reruns launch the configuration as it is saved now.
+  const failing = c.tests.failing(config(c.tests.config));
+  useRun.setState((s) => ({ configs: s.configs.map((x) => (x.id === failing.id ? failing : x)) }));
+  const { id, output } = await runToEnd(failing);
   const tests = runtime(id)!.tests!;
   const log = `\n--- output ---\n${output.slice(-80).join("\n")}`;
   expect(tests.counts(), log).toMatchObject({ passed: c.tests.passed, failed: 1 });
@@ -215,7 +246,7 @@ async function smoke(language: string) {
   // Rerun Failed Tests runs that one test only.
   const rerunOutput: string[] = [];
   const before = useRun.getState().sessions.find((s) => s.id === id)!.startedAt;
-  expect(rerunFailed(id), "Rerun Failed Tests is offered").toBe(true);
+  expect(await rerunFailed(id), "Rerun Failed Tests is offered").toBe(true);
   const ended = () => {
     const s = useRun.getState().sessions.find((s) => s.id === id)!;
     return s.startedAt > before && s.endedAt !== null && s.endedAt >= s.startedAt;

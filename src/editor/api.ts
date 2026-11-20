@@ -28,10 +28,14 @@ import {
   type RangeSet,
   type Transaction,
 } from "@codemirror/state";
-import { GutterMarker, ViewPlugin, type EditorView } from "@codemirror/view";
+import { GutterMarker, ViewPlugin, type EditorView, type ViewUpdate } from "@codemirror/view";
 import type { LanguageDescription } from "@codemirror/language";
+import type { HunkKind } from "@/bindings";
+import type { LineEnding } from "@/platform/ipc";
 import { create } from "zustand";
-import { maybeEditorService } from "@/workbench/contributions";
+import { maybeEditorService, type EditorInput } from "@/workbench/contributions";
+import { cornerInset } from "@/editor/core/cm/cornerInset";
+export { iconAreaSource, mapLineStart, type IconAreaSource } from "@/editor/core/cm/iconArea";
 
 /** Documents above this size (UTF-16 units) skip per-line decorations. */
 export const HEAVY_LIMIT = 8_000_000;
@@ -63,11 +67,64 @@ export interface EditorContribution {
    * editable side, the merge result), which get `doc: -1`. Default false.
    */
   embedded?: boolean;
+  /**
+   * Extensions for a notebook code cell's editor, whose `doc` and `path` are the cell's
+   * language-server document and URI (see {@link cellEditorExtensions}).
+   */
+  cellExtensions?: (ctx: EditorDocContext) => Extension | Extension[];
+  /**
+   * Extensions for a diff viewer pane that shows a file's open document (the working copy,
+   * Compare Files): `ctx` is that document's (see {@link diffSideExtensions}).
+   */
+  diffExtensions?: (ctx: EditorDocContext) => Extension | Extension[];
+}
+
+/**
+ * Editor extensions whose code loads with the first editor that wants them: `wants`
+ * decides synchronously, `load` resolves the real `extensions`. Until it has, the editor
+ * runs without them and reconfigures once loaded.
+ */
+export function lazyEditorExtension(
+  wants: (ctx: EditorDocContext) => boolean,
+  load: () => Promise<(ctx: EditorDocContext) => Extension>,
+): (ctx: EditorDocContext) => Extension {
+  let loaded: ((ctx: EditorDocContext) => Extension) | null = null;
+  let pending: Promise<(ctx: EditorDocContext) => Extension> | null = null;
+  const get = () =>
+    (pending ??= load().then(
+      (f) => (loaded = f),
+      (e: unknown) => {
+        pending = null;
+        throw e;
+      },
+    ));
+  return (ctx) => {
+    if (!wants(ctx)) return [];
+    if (loaded) return loaded(ctx);
+    const slot = new Compartment();
+    return [
+      slot.of([]),
+      ViewPlugin.define((view) => {
+        let live = true;
+        get().then(
+          (f) => live && view.dispatch({ effects: slot.reconfigure(f(ctx)) }),
+          (e: unknown) => console.error("could not load editor extensions", e),
+        );
+        return {
+          destroy: () => {
+            live = false;
+          },
+        };
+      }),
+    ];
+  };
 }
 
 export interface TextEditorHandle {
   view: EditorView;
   ctx: EditorDocContext;
+  /** The editor tab it shows, for the editors of tabs (not diff sides, previews…). */
+  tabId?: string;
 }
 
 interface EditorRegistry {
@@ -136,6 +193,34 @@ export function embeddedEditorExtensions(path: string): Extension {
 }
 
 const embeddedOf = (m: Map<string, EditorContribution>) => [...m.values()].filter((c) => c.embedded);
+
+/** The `diffExtensions` of every contribution, for a diff pane showing the open document of `ctx`. */
+export function diffSideExtensions(ctx: EditorDocContext): Extension[] {
+  const out: Extension[] = [];
+  for (const c of editorContributions()) {
+    if (!c.diffExtensions) continue;
+    try {
+      out.push(c.diffExtensions(ctx));
+    } catch (e) {
+      console.error(`editor contribution ${c.id} failed`, e);
+    }
+  }
+  return out;
+}
+
+/** The `cellExtensions` of every contribution, for the editor of a notebook code cell. */
+export function cellEditorExtensions(ctx: EditorDocContext): Extension[] {
+  const out: Extension[] = [];
+  for (const c of editorContributions()) {
+    if (!c.cellExtensions) continue;
+    try {
+      out.push(c.cellExtensions(ctx));
+    } catch (e) {
+      console.error(`editor contribution ${c.id} failed`, e);
+    }
+  }
+  return out;
+}
 
 useEditorRegistry.subscribe((s, prev) => {
   if (s.contributions === prev.contributions) return;
@@ -208,14 +293,49 @@ export const documentSynced = Facet.define<() => Promise<void>, (() => Promise<v
   combine: (values) => values[0] ?? null,
 });
 
+/**
+ * Undo / Redo of an editor whose history is kept outside CodeMirror (notebook cells share
+ * the notebook's backend history). Commands that would call CodeMirror's history (Vim's
+ * `u` / `Ctrl-R`) go through it instead.
+ */
+export interface ExternalHistory {
+  undo(): void;
+  redo(): void;
+}
+
+export const externalHistory = Facet.define<ExternalHistory, ExternalHistory | null>({
+  combine: (values) => values[0] ?? null,
+});
+
+/**
+ * Provided by a host of several editors in a column (notebook cells): moves the caret into the
+ * editor before (`-1`) or after (`1`) this one, at `column` of its nearest line, when a line
+ * motion leaves this editor's first or last line. Returns false when there is none.
+ */
+export type AdjacentEditor = (direction: 1 | -1, column: number) => boolean;
+
+export const adjacentEditor = Facet.define<AdjacentEditor, AdjacentEditor | null>({
+  combine: (values) => values[0] ?? null,
+});
+
 export function whenSynced(view: EditorView): Promise<void> {
   return view.state.facet(documentSynced)?.() ?? Promise.resolve();
+}
+
+/** Edits made outside text editors (notebook cells) that language servers must have before a request. */
+const pendingEdits = new Set<() => Promise<void>>();
+
+/** `settled` resolves once the owner's edits reached the backend; included in {@link whenAllSynced}. */
+export function registerPendingEdits(settled: () => Promise<void>): () => void {
+  pendingEdits.add(settled);
+  return () => void pendingEdits.delete(settled);
 }
 
 /** Every open editor's edits reached the backend (language servers answer from its copy). */
 export function whenAllSynced(): Promise<void> {
   const editors = useEditorRegistry.getState().editors;
-  return editors.size ? Promise.all([...editors].map((e) => whenSynced(e.view))).then(() => {}) : Promise.resolve();
+  const waits = [...[...editors].map((e) => whenSynced(e.view)), ...[...pendingEdits].map((settled) => settled())];
+  return waits.length ? Promise.all(waits).then(() => {}) : Promise.resolve();
 }
 
 /** True for doc changes that did not originate from typing in *this* view. */
@@ -238,8 +358,12 @@ export interface ScrollbarMark {
   to?: number;
   /** CSS colour, normally a token such as `var(--danger)`. */
   color: string;
-  /** `line` (default): 4px-wide bar on the lane; `thin`: 2px bar (search hits, occurrences). */
-  kind?: "line" | "thin";
+  /**
+   * `line` (default): 4px-wide bar on the lane; `thin`: 2px bar (search hits, occurrences);
+   * `full`: the lane's whole width, from the top of the first line to the top of the last (IDEA's
+   * diff and merge error stripe, so a one-line change is a min-height dash).
+   */
+  kind?: "line" | "thin" | "full";
   /** Shown on hover. */
   tooltip?: string;
   /** Higher wins when marks overlap. Default 0. */
@@ -261,6 +385,21 @@ export const scrollbarMarks = Facet.define<readonly ScrollbarMark[], readonly Sc
  * Several providers are layered (later ones on top).
  */
 export const gutterLaneMarkers = Facet.define<RangeSet<GutterMarker>>();
+
+/**
+ * The VCS changes the change-marker lane shows, as document offsets of this state (mapped
+ * through edits), in file order. `to <= from` draws a deletion notch on the line at `from`.
+ * Editor panels read them (`openidea.editor.changes()`).
+ */
+export interface LineChange {
+  kind: HunkKind;
+  from: number;
+  to: number;
+}
+
+export const lineChanges = Facet.define<readonly LineChange[], readonly LineChange[]>({
+  combine: (values) => values[0] ?? [],
+});
 
 /** Marker for `gutterLaneMarkers`: a solid 3px bar (or a small wedge for `deleted`). */
 export class LaneMarker extends GutterMarker {
@@ -289,6 +428,22 @@ export class LaneMarker extends GutterMarker {
 }
 
 /**
+ * A gutter spacer that renders nothing: pair it with `gutter`'s `updateSpacer`
+ * to reserve icon width only while the file has something to show.
+ */
+export const emptyGutterSpacer = new (class extends GutterMarker {})();
+
+/** A gutter spacer reserving one icon of width, styled by `className`. */
+export const gutterSpacer = (className: string) =>
+  new (class extends GutterMarker {
+    override toDOM(): Node {
+      const el = document.createElement("span");
+      el.className = className;
+      return el;
+    }
+  })();
+
+/**
  * The floating row at the editor's top-right (IDEA's inspection widget area): widgets
  * append their element to it (CSS `order` sorts them; lower first) and remove it when
  * done. The inspection widget sits there; code review adds its Review Mode group.
@@ -312,6 +467,8 @@ export function editorCorner(view: EditorView): HTMLElement {
     gap: "4px",
   });
   view.dom.appendChild(el);
+  // The lines leave room for its measured width, so it never covers a line end.
+  view.plugin(cornerInset)?.track(el);
   return el;
 }
 
@@ -333,7 +490,11 @@ export type ContributedFormatter = (
   range: { from: number; to: number } | null,
 ) => Array<{ from: number; to: number; insert: string }>;
 /** Go to Declaration / ⌘-click: `true` when it handled `pos`. */
-export type ContributedDefinition = (view: EditorView, pos: number) => boolean;
+export interface ContributedDefinition {
+  (view: EditorView, pos: number): boolean;
+  /** Cheap, side-effect-free eligibility for hover underline and navigation probing. */
+  canHandle?(state: EditorState, pos: number): boolean;
+}
 /** Hover and Quick Documentation: Markdown about the symbol at `pos`. */
 export type ContributedHover = (
   state: EditorState,
@@ -342,6 +503,16 @@ export type ContributedHover = (
 
 export function contributedAt<T>(state: EditorState, key: string, pos: number): T | undefined {
   return state.languageDataAt<T>(key, pos)[0];
+}
+
+/**
+ * Every provider registered for a contributed language-data key at `pos`. A provider may
+ * be present for the document but decline this particular position (the MyBatis SQL
+ * provider on a Maven POM, for example), so callers that dispatch a request must not stop
+ * at the first entry when it returns "not handled".
+ */
+export function contributedAtAll<T>(state: EditorState, key: string, pos: number): readonly T[] {
+  return state.languageDataAt<T>(key, pos);
 }
 
 /** A context action a feature offers at the caret, listed by Show Context Actions (⌥↵). */
@@ -355,6 +526,17 @@ export interface ContributedIntention {
 
 /** A background provider has new context actions for the current document. */
 export const intentionsChanged = StateEffect.define<null>();
+
+/**
+ * A hidden editor view is shown again. Recently used tabs keep their view, detached from the
+ * document, while hidden; plugins that skip work while `view.dom` is disconnected redo it when
+ * `shownAgain`.
+ */
+export const viewShown = StateEffect.define<null>();
+
+export function shownAgain(u: ViewUpdate): boolean {
+  return u.transactions.some((tr) => tr.effects.some((e) => e.is(viewShown)));
+}
 
 /** Local fixes of a diagnostic range (hover link and Apply Quick Fix). */
 export const quickFixProviders = Facet.define<(view: EditorView, from: number, to: number) => ContributedIntention[]>();
@@ -386,6 +568,8 @@ export interface NavigationLocation {
   col: number;
   /** `Date.now()` when the location was last visited. */
   time: number;
+  /** A place that is a tab rather than a text position (a diff), opened with this input on Back. */
+  input?: EditorInput;
 }
 
 export interface NavigationHistorySnapshot {
@@ -407,17 +591,41 @@ export function _provideNavigationHistory(provider: () => NavigationHistorySnaps
   navigationHistoryProvider = provider;
 }
 
+/** A project↔file-editor switch is clearing and re-filling the tabs. @internal editor/core only. */
+let editorSwitchingFlag = false;
+export function _setEditorSwitching(value: boolean) {
+  editorSwitchingFlag = value;
+}
+export function editorSwitching(): boolean {
+  return editorSwitchingFlag;
+}
+
 // --- editor events ------------------------------------------------------------
 
 export type EditorEvent =
+  | { type: "inputModeChanged"; path: string; mode: string; sub: string | null }
   | { type: "docOpened"; doc: number; path: string; language: string }
   | { type: "docClosed"; doc: number; path: string }
   /** After the backend wrote the file. */
   | { type: "docSaved"; doc: number; path: string }
+  /** A local edit accepted by the shared document model. UTF-16 offsets. */
+  | {
+      type: "docChanged";
+      doc: number;
+      path: string;
+      baseVersion: number;
+      version: number;
+      changes: Array<{ from: number; to: number; insert: string }>;
+    }
   /** The active (focused or last focused) editor tab changed; `path` is null for non-file tabs. */
   | { type: "activeEditorChanged"; path: string | null; doc: number | null }
   /** Caret moved in the active text editor (throttled to animation frames). 0-based. */
   | { type: "caretMoved"; doc: number; path: string; line: number; col: number; offset: number };
+
+/** Reports the focused editor's input mode from an editor contribution. */
+export function reportInputMode(path: string, mode: string, sub: string | null) {
+  _emitEditorEvent({ type: "inputModeChanged", path, mode, sub });
+}
 
 type EditorEventListener = (e: EditorEvent) => void;
 const editorEventListeners = new Set<EditorEventListener>();
@@ -480,7 +688,7 @@ export function _saveParticipants(): SaveParticipant[] {
 export async function revealRange(
   path: string,
   range: { start: { line: number; col: number }; end?: { line: number; col: number } },
-  options: { preview?: boolean; focus?: boolean } = {},
+  options: { preview?: boolean; focus?: boolean; external?: boolean } = {},
 ): Promise<void> {
   const service = maybeEditorService();
   if (!service) return;
@@ -513,6 +721,8 @@ export interface CodeLens {
   run?: (view: EditorView, event: MouseEvent) => void;
   /** Lower first within a line. Default 100. */
   order?: number;
+  /** The Code Vision setting that places it ("usages", "author"); a lens without one goes above the line. */
+  kind?: string;
 }
 
 export const codeLenses = Facet.define<readonly CodeLens[], readonly CodeLens[]>({
@@ -539,6 +749,10 @@ export function setShownLine(path: string, line: number | null) {
     else next[path] = line;
     return next;
   }, true);
+}
+
+export function shownLine(path: string): number | null {
+  return useShownLines.getState()[path] ?? null;
 }
 
 export function useShownLine(path: string | null): number | null {
@@ -582,7 +796,8 @@ export function isLibraryPath(path: string): boolean {
  * A live view of an open document for a CodeMirror view that is not an editor
  * tab (e.g. the editable side of a diff). Edits sync both ways with the
  * document shared by all editors of the file, go to the backend, and are saved
- * by Save All; the view keeps its own undo history, like a split pane.
+ * by Save All. With `sharedHistory`, typing uses the text tab's history;
+ * otherwise the view keeps its own history, like a split pane.
  */
 export interface DocumentAttachment {
   path: string;
@@ -590,9 +805,17 @@ export interface DocumentAttachment {
   doc: number;
   /** Current document text; build the view's state from it. */
   text(): string;
+  /** The document's line ending (detected on load, as the status bar shows). */
+  lineEnding(): LineEnding;
   /** The document's language mode name (backend-assigned, as the editor tabs use). */
   uiMode(): string | null;
+  /** The document's context, as editor contributions receive it. */
+  context(): EditorDocContext;
   readOnly: boolean;
+  /** Last view state, kept current while unmounted; use it when remounting this attachment. */
+  editorState(): EditorState | null;
+  /** Dispatch typing through the document history when `sharedHistory` was requested. */
+  dispatchTransactions(transactions: readonly Transaction[], view: EditorView): void;
   /** Add to the view (one view at a time). */
   extension: Extension;
   save(options?: { exact?: boolean }): Promise<void>;
@@ -618,16 +841,22 @@ export interface DocumentAttachment {
   release(): void;
 }
 
-let documentAttacher: ((path: string) => Promise<DocumentAttachment>) | null = null;
+export interface DocumentAttachmentOptions {
+  /** Record typing in the text tab's history when one exists. Use `dispatchTransactions` on the view. */
+  sharedHistory?: boolean;
+}
+
+let documentAttacher: ((path: string, options?: DocumentAttachmentOptions) => Promise<DocumentAttachment>) | null =
+  null;
 
 /** Opens (or joins) the document of `path` for a non-tab view. */
-export function attachDocument(path: string): Promise<DocumentAttachment> {
+export function attachDocument(path: string, options?: DocumentAttachmentOptions): Promise<DocumentAttachment> {
   if (!documentAttacher) return Promise.reject(new Error("editor not started"));
-  return documentAttacher(path);
+  return documentAttacher(path, options);
 }
 
 /** Called by editor/core only. */
-export function _provideDocumentAttacher(attacher: ((path: string) => Promise<DocumentAttachment>) | null) {
+export function _provideDocumentAttacher(attacher: typeof documentAttacher) {
   documentAttacher = attacher;
 }
 
@@ -653,21 +882,22 @@ export function _languageMode(name: string): LanguageDescription | undefined {
   return languageModes.get(name);
 }
 
-// --- read-only code previews ------------------------------------------------------
+// --- code previews ------------------------------------------------------
 
-let codePreviewProvider: ((path: string) => Promise<Extension>) | null = null;
+let codePreviewProvider: ((path: string, editable?: boolean) => Promise<Extension>) | null = null;
 
 /**
- * Extensions for a read-only CodeMirror view showing `path` like an editor tab
+ * Extensions for a CodeMirror view showing `path` like an editor tab
  * (editor font and colours, line numbers, syntax highlighting): previews
- * outside editor tabs such as Find in Files. Empty before editor/core starts.
+ * outside editor tabs such as Find in Files. Read-only unless `editable` is true.
+ * Empty before editor/core starts.
  */
-export function codePreviewExtensions(path: string): Promise<Extension> {
-  return codePreviewProvider ? codePreviewProvider(path) : Promise.resolve([]);
+export function codePreviewExtensions(path: string, editable = false): Promise<Extension> {
+  return codePreviewProvider ? codePreviewProvider(path, editable) : Promise.resolve([]);
 }
 
 /** @internal editor/core only. */
-export function _provideCodePreview(provider: ((path: string) => Promise<Extension>) | null) {
+export function _provideCodePreview(provider: typeof codePreviewProvider) {
   codePreviewProvider = provider;
 }
 

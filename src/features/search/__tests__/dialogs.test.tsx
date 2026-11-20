@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { registerAction } from "@/platform/actions";
+import { clearContext, getContext, setContext, type ContextKeys } from "@/platform/context";
 import type { SeDeps } from "../everywhere/controller";
 
 const defaultFindFiles: SeDeps["findFiles"] = async (q) =>
@@ -12,6 +13,7 @@ const fakeDeps = (): SeDeps => ({
   findFiles: (...args) => findFiles(...args),
   findSymbols: (...args) => findSymbols(...args),
   settings: () => settings(),
+  categories: () => contributions.searchCategories(),
   searchText: async () => {},
   cancel: () => {},
   nextRequestId: () => 1,
@@ -28,13 +30,16 @@ vi.mock("../common/open", async (orig) => ({
   openLocation: vi.fn(async () => {}),
 }));
 
-vi.mock("../everywhere/deps", () => ({
-  ipcDeps: () => fakeDeps(),
-  loadLanguages: async () => [
-    { id: "kotlin", name: "Kotlin", extensions: ["kt"] },
-    { id: "markdown", name: "Markdown", extensions: ["md"] },
-  ],
-}));
+vi.mock("../everywhere/deps", async (orig) => {
+  const { ipcDeps } = await orig<typeof import("../everywhere/deps")>();
+  return {
+    ipcDeps: (ctx: ContextKeys) => ({ ...fakeDeps(), isEnabled: ipcDeps(ctx).isEnabled }),
+    loadLanguages: async () => [
+      { id: "kotlin", name: "Kotlin", extensions: ["kt"] },
+      { id: "markdown", name: "Markdown", extensions: ["md"] },
+    ],
+  };
+});
 vi.mock("../find/windowStore", async (orig) => ({
   ...(await orig<typeof import("../find/windowStore")>()),
   ipcFindDeps: () => ({
@@ -53,9 +58,9 @@ vi.mock("../find/windowStore", async (orig) => ({
 }));
 
 const contributions = await import("@/workbench/contributions");
-const { commands } = await import("@/platform/ipc");
+const { commands, emitLocalIdeEvent } = await import("@/platform/ipc");
 const { RecentPopupsOverlay } = await import("../recent/RecentPopups");
-const { showRecentPopup, hideRecentPopup, useRecentPopup } = await import("../recent/store");
+const { cycleSwitcher, showRecentPopup, hideRecentPopup, useRecentPopup } = await import("../recent/store");
 const { openLocation } = await import("../common/open");
 const { usePlatform } = await import("@/platform/platformInfo");
 const { allActions } = await import("@/platform/actions");
@@ -108,6 +113,29 @@ describe("Search Everywhere dialog", () => {
     expect(useSearchEverywhere.getState().open).toBe(false);
     expect(run).toHaveBeenCalled();
     dispose();
+  });
+
+  it("passes the Text tab's query to Find in Files as typed, port included", async () => {
+    const run = vi.fn();
+    const dispose = registerAction({ id: "find.inPath", title: "Find in Files", run });
+    render(<SearchEverywhereOverlay />);
+    act(() => showSearchEverywhere("text", { query: "http://localhost:8080" }));
+    await tick();
+    fireEvent.keyDown(screen.getByLabelText("Search query"), { key: "Enter", metaKey: true, ctrlKey: true });
+    await tick();
+    expect(run.mock.calls[0]![0].arg).toEqual({ query: "http://localhost:8080" });
+    dispose();
+  });
+
+  it("refreshes the current file query after index invalidation finishes", async () => {
+    render(<SearchEverywhereOverlay />);
+    act(() => showSearchEverywhere("files", { query: "order" }));
+    await tick();
+    expect(document.getElementById("se-results")!.textContent).toContain("OrderController");
+    findFiles = async () => [];
+    act(() => emitLocalIdeEvent({ type: "indexState", indexing: false, files: 0, symbols: 0 }));
+    await tick();
+    expect(document.getElementById("se-results")!.textContent).not.toContain("OrderController");
   });
 
   it("the preview toggle is remembered", async () => {
@@ -194,6 +222,73 @@ describe("Search Everywhere dialog", () => {
     expect(assign).toHaveBeenCalledWith("test.pizza");
     expect(useSearchEverywhere.getState().open).toBe(false);
     disposers.forEach((d) => d());
+  });
+
+  it("hides unavailable commands until requested and uses the editor's captured context for available ones", async () => {
+    const unavailable = vi.fn();
+    const available = vi.fn();
+    const disposers = [
+      registerAction({
+        id: "test.cellNull",
+        title: "Set Test Cell NULL",
+        when: "testEditorFocus",
+        enabled: () => false,
+        run: unavailable,
+      }),
+      registerAction({
+        id: "test.cellDefault",
+        title: "Set Test Cell Default",
+        when: "testEditorFocus",
+        enabled: ({ ctx }) => ctx.testEditorFocus === true && !ctx.popupOpen,
+        run: available,
+      }),
+    ];
+    try {
+      render(
+        <>
+          <button
+            onFocus={() => setContext("testEditorFocus", true)}
+            onBlur={() => setContext("testEditorFocus", false)}
+          >
+            Test editor
+          </button>
+          <SearchEverywhereOverlay />
+        </>,
+      );
+      act(() => screen.getByRole("button", { name: "Test editor" }).focus());
+      act(() => showSearchEverywhere("actions", { query: "Set Test Cell NULL" }));
+      await tick();
+      expect(getContext().testEditorFocus).toBe(false);
+      const checkbox = screen.getByLabelText("Include disabled actions");
+      const input = screen.getByLabelText("Search query");
+      const nullAction = () => screen.queryByRole("option", { name: /Set Test Cell NULL/ });
+      expect(checkbox).not.toBeChecked();
+      expect(nullAction()).toBeNull();
+      expect(screen.getByText("Nothing found", { exact: true })).toBeInTheDocument();
+
+      fireEvent.click(checkbox);
+      await tick();
+      expect(checkbox).toBeChecked();
+      expect(nullAction()?.querySelector('[aria-disabled="true"]')).toBeInTheDocument();
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(unavailable).not.toHaveBeenCalled();
+      expect(useSearchEverywhere.getState().open).toBe(true);
+
+      fireEvent.click(checkbox);
+      await tick();
+      expect(nullAction()).toBeNull();
+      fireEvent.change(input, { target: { value: "Set Test Cell Default" } });
+      await tick();
+      const action = screen.getByRole("option", { name: /Set Test Cell Default/ });
+      expect(action.querySelector('[aria-disabled="true"]')).toBeNull();
+      fireEvent.keyDown(input, { key: "Enter" });
+      await tick();
+      expect(available).toHaveBeenCalledOnce();
+      expect(useSearchEverywhere.getState().open).toBe(false);
+    } finally {
+      disposers.forEach((dispose) => dispose());
+      clearContext("testEditorFocus");
+    }
   });
 
   it("filters Files by file type from the funnel, remembering the choice", async () => {
@@ -445,6 +540,22 @@ describe("Recent Files multi-selection", () => {
     expect(useRecentPopup.getState().open).toBeNull();
   });
 
+  it("Delete edits the filter while it has text after the caret, else removes the file", async () => {
+    const remove = vi.spyOn(commands, "removeRecent").mockResolvedValue({ status: "ok", data: null });
+    const input = (await showFiles()) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "index" } });
+    const before = options().length;
+    input.setSelectionRange(0, 0);
+    fireEvent.keyDown(input, { key: "Delete" });
+    await tick();
+    expect(options()).toHaveLength(before);
+    expect(remove).not.toHaveBeenCalled();
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Delete" });
+    await tick();
+    expect(options()).toHaveLength(before - 1);
+  });
+
   it("starts a range at the initially selected previous file", async () => {
     vi.spyOn(contributions, "maybeEditorService").mockReturnValue({
       activePath: () => "/p/one/index.ts",
@@ -473,6 +584,44 @@ describe("Recent Files multi-selection", () => {
     click(1, {});
     await tick();
     expect(openLocation).toHaveBeenCalledExactlyOnceWith("/p/two/index.ts", null, { side: false });
+  });
+});
+
+describe("Switcher", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("opens the selection when Ctrl is released, once the popup closed, in the same task", async () => {
+    const tab = (key: string, lastActive: number) => ({
+      input: { kind: "agent-session", key },
+      title: key,
+      icon: "toolwindow-agents",
+      lastActive,
+    });
+    const seen: Array<{ key: string; popup: boolean; focus: Element | null }> = [];
+    vi.spyOn(commands, "recentFiles").mockResolvedValue({ status: "ok", data: [] });
+    vi.spyOn(contributions, "maybeEditorService").mockReturnValue({
+      openTabs: () => [tab("task-b", 2), tab("task-a", 1)],
+      openPaths: () => [],
+      activePath: () => null,
+      openInput: async (input: { key: string }) => {
+        seen.push({ key: input.key, popup: !!screen.queryByRole("dialog"), focus: document.activeElement });
+      },
+    } as unknown as import("@/workbench/contributions").EditorService);
+    render(
+      <>
+        <button type="button">editor</button>
+        <RecentPopupsOverlay />
+      </>,
+    );
+    const editor = screen.getByRole("button", { name: "editor" });
+    editor.focus();
+    act(() => cycleSwitcher(1));
+    await tick();
+    expect(screen.getByRole("dialog", { name: "Switcher" })).toBeInTheDocument();
+    act(() => void fireEvent.keyUp(window, { key: "Control" }));
+    // The editor opened takes focus itself: the one left behind doesn't get it back first.
+    expect(seen).toEqual([{ key: "task-a", popup: false, focus: document.body }]);
+    expect(editor).not.toHaveFocus();
   });
 });
 
@@ -513,4 +662,53 @@ describe("Find in Files dialog", () => {
       useKeymap.setState({ preset: previous.preset });
     }
   });
+});
+
+it("restarts a custom query restored before its debounce expires", async () => {
+  let resolve!: (page: import("@/bindings").PluginSearchPage) => void;
+  const search = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          resolve = r;
+        }),
+    )
+    .mockResolvedValue({
+      items: [
+        {
+          id: "fresh",
+          title: "Fresh route",
+          description: null,
+          target: {
+            kind: "location",
+            value: {
+              path: "/p/routes.txt",
+              range: { start: { line: 0, col: 0 }, end: { line: 0, col: 0 } },
+              uri: null,
+            },
+          },
+        },
+      ],
+      hasMore: false,
+    });
+  const remove = contributions.registerSearchCategory({
+    id: "plugin:test:routes",
+    title: "Routes",
+    search,
+    command: () => undefined,
+  });
+  render(<SearchEverywhereOverlay />);
+  act(() => showSearchEverywhere("plugin:test:routes", { query: "abc" }));
+  await tick();
+  expect(search).toHaveBeenCalledTimes(1);
+  const input = screen.getByRole("combobox");
+  fireEvent.change(input, { target: { value: "abcd" } });
+  fireEvent.change(input, { target: { value: "abc" } });
+  await tick();
+  expect(search).toHaveBeenCalledTimes(2);
+  expect(screen.getByText("Fresh route")).toBeVisible();
+  await act(async () => resolve({ items: [], hasMore: false }));
+  expect(screen.getByText("Fresh route")).toBeVisible();
+  act(remove);
 });

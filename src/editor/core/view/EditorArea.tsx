@@ -1,4 +1,5 @@
-import { useFilePresentationIcons } from "@/platform/filePresentation";
+import { ContributedToolbar } from "@/workbench/ContributedToolbar";
+import { useFilePresentations } from "@/ui/filePresentation";
 /**
  * The editor area: split layout of panes, each with IDEA-style tabs (preview
  * tab in italics, pinned tabs, modified dot, file icons coloured by file
@@ -12,6 +13,7 @@ import { executeAction } from "@/platform/actions";
 import { setContext } from "@/platform/context";
 import { useEditorPrefs } from "@/platform/editorSettings";
 import { basename, dirname } from "@/platform/project";
+import { gitRevisionOf } from "@/platform/virtualDocs";
 import {
   EDITOR_TAB_MIME,
   acceptsEditorDrop,
@@ -19,13 +21,19 @@ import {
   getFileDecoration,
   prepareMenuGroups,
   textEditorWrapperFor,
+  EditorShownProvider,
+  EditorTabIdProvider,
   useContributions,
+  useEditorGroupPanels,
   useFileDecorations,
   useEditorDocumentRevision,
+  useEditorTabTitles,
   useTextEditorWrappers,
   type EditorInput,
+  type EditorKindContribution,
 } from "@/workbench/contributions";
 import { useDistractionFree } from "@/workbench/distractionFree";
+import { useFileColors } from "@/workbench/fileColors";
 import { EmptyEditor } from "@/workbench/EditorArea";
 import {
   EmptyState,
@@ -42,7 +50,15 @@ import {
   type TabItem,
   type TabsDnd,
 } from "@/ui";
-import { editorController, isTextInput, tabIcon, tabTitle, useTabs, type VirtualInputData } from "../controller";
+import {
+  editorController,
+  isTextInput,
+  tabIcon,
+  tabTitle,
+  tabTrailing,
+  useTabs,
+  type VirtualInputData,
+} from "../controller";
 import { useDocMeta } from "../model/document";
 import { inputDirty } from "../model/customDocuments";
 import type { LayoutNode, SplitEdge, Tab } from "../model/tabs";
@@ -52,8 +68,14 @@ import { TextEditorHost } from "./TextEditorHost";
 import { FindBar } from "./FindBar";
 import { EditorBanners, VirtualBanner } from "./Banner";
 import { CodeBreadcrumbs } from "./StatusItems";
+import { SideTabsResizer, useSideTabsStyle } from "./SideTabsResizer";
 import styles from "./EditorArea.module.css";
 import { tx } from "@/platform/i18n";
+
+/** The documents of a project-files drag: folders (trailing `/`) are not opened as editors. */
+function droppedFiles(payload: string): string[] {
+  return payload.split("\n").filter((p) => !!p && !p.endsWith("/"));
+}
 
 export function EditorAreaView() {
   const layout = useTabs((s) => s.layout);
@@ -75,14 +97,14 @@ function EmptyEditorArea() {
     if (!el) return;
     return registerDropTarget(el, {
       accepts: (type) => type === EDITOR_TAB_MIME || type === FILES_DRAG || acceptsEditorDrop(type),
-      over: () => setOver(true),
+      over: (data) => setOver(data.type !== FILES_DRAG || droppedFiles(data.payload).length > 0),
       leave: () => setOver(false),
       drop: (data) => {
         setOver(false);
         const paneId = Object.keys(useTabs.getState().panes)[0];
         if (!paneId) return;
         if (data.type === FILES_DRAG) {
-          void editorController().openFilesIn(data.payload.split("\n").filter(Boolean), paneId, "center");
+          void editorController().openFilesIn(droppedFiles(data.payload), paneId, "center");
           return;
         }
         if (data.type !== EDITOR_TAB_MIME) {
@@ -97,7 +119,7 @@ function EmptyEditorArea() {
   return (
     <div ref={ref} className={styles.area}>
       <EmptyEditor />
-      {over && <div className={clsx(styles.dropZone, styles["drop-center"])} aria-hidden="true" />}
+      {over && <div className={styles.dropZone} aria-hidden="true" />}
     </div>
   );
 }
@@ -139,7 +161,11 @@ function useTitleHints(): Map<string, string> {
       return out.sort();
     }),
   );
-  return useMemo(() => disambiguateTitles(paths), [paths]);
+  const labels = useFileDecorations(useShallow(() => paths.map((p) => getFileDecoration(p)?.tabTitle ?? basename(p))));
+  return useMemo(() => {
+    const byPath = new Map(paths.map((p, i) => [p, labels[i]!]));
+    return disambiguateTitles(paths, (p) => byPath.get(p) ?? basename(p));
+  }, [paths, labels]);
 }
 
 const virtualData = (input: EditorInput) => input.data as VirtualInputData | undefined;
@@ -150,6 +176,7 @@ function PaneView({ paneId }: { paneId: string }) {
   const isActivePane = useTabs((s) => s.activePane === paneId);
   const multiPane = useTabs((s) => s.layout.kind === "split");
   const kinds = useContributions((s) => s.editorKinds);
+  const titleRevision = useEditorTabTitles((s) => s.revision);
   const tabs = useMemo(() => pane?.tabs ?? [], [pane]);
   const paths = tabs.map((t) => t.input.path ?? "");
   const textDirty = useDocMeta(useShallow((s) => paths.map((p) => !!s[p]?.dirty)));
@@ -157,6 +184,10 @@ function PaneView({ paneId }: { paneId: string }) {
   const dirty = tabs.map((tab, i) => inputDirty(tab.input, kinds) ?? textDirty[i] ?? false);
   const colors = useFileDecorations(useShallow(() => paths.map((p) => (p ? (getFileDecoration(p)?.color ?? "") : ""))));
   const tints = useFileDecorations(useShallow(() => paths.map((p) => (p ? (getFileDecoration(p)?.tint ?? "") : ""))));
+  const tabLabels = useFileDecorations(useShallow(() => paths.map((p) => getFileDecoration(p)?.tabTitle)));
+  const tabIcons = useFileDecorations(useShallow(() => paths.map((p) => getFileDecoration(p)?.tabIcon)));
+  const errors = useFileDecorations(useShallow(() => paths.map((p) => !!p && !!getFileDecoration(p)?.error)));
+  const fileColors = useFileColors("editorTabs");
 
   const hints = useTitleHints();
   const [dropZone, setDropZone] = useState<DropZone | null>(null);
@@ -165,52 +196,74 @@ function PaneView({ paneId }: { paneId: string }) {
   const { showExtension, markModified, showCloseButton, showFileIcon, showDirectoryForNonUnique, showFullPathOnHover } =
     tabPrefs;
 
-  const fileIcons = useFilePresentationIcons(
-    showFileIcon ? tabs.flatMap((t) => (t.input.kind === "file" && t.input.path ? [t.input.path] : [])) : [],
+  const files = useFilePresentations(
+    tabs.flatMap((t) => (t.input.kind === "file" && t.input.path ? [t.input.path] : [])),
   );
   const items: TabItem[] = useMemo(() => {
+    // A kind's title may change without the tab state (a renamed agent task).
+    void titleRevision;
     const names = tabs.map((t) => tabTitle(t.input, kinds));
     return tabs.map((t, i) => {
       const full = names[i]!;
       const dot = full.lastIndexOf(".");
-      const name = t.input.kind === "file" && !showExtension && dot > 0 ? full.slice(0, dot) : full;
+      const name = tabLabels[i] ?? (t.input.kind === "file" && !showExtension && dot > 0 ? full.slice(0, dot) : full);
       const dupe = !showDirectoryForNonUnique
         ? null
         : t.input.kind === "file" && t.input.path
           ? (hints.get(t.input.path) ?? null)
           : names.filter((n) => n === name).length > 1 && t.input.path
-            ? basename(dirname(t.input.path))
+            ? (gitRevisionOf(t.input.path)?.revision.slice(0, 8) ?? basename(dirname(t.input.path)))
             : null;
+      const kindMark = tabTrailing(t.input, kinds);
+      const pin = t.pinned ? <Icon name="pin" size={11} className={styles.pin} label="Pinned" /> : null;
+      const file = t.input.kind === "file" && t.input.path ? files.get(t.input.path) : undefined;
+      const title = markModified && dirty[i] ? `*${name}` : name;
       return {
         id: t.id,
         label: (
           <>
-            {markModified && dirty[i] ? `*${name}` : name}
+            {file?.deprecated ? <span className={styles.deprecated}>{title}</span> : title}
             {dupe && <span className={styles.dupe}>{dupe}</span>}
           </>
         ),
         text: dupe ? `${name} — ${dupe}` : name,
         icon: showFileIcon
           ? t.input.kind === "file" && t.input.path
-            ? fileIcons.get(t.input.path)
+            ? (tabIcons[i] ?? file?.icon)
             : tabIcon(t.input, kinds)
           : undefined,
         italic: t.preview,
+        error: t.input.kind === "file" && errors[i],
         modified: dirty[i],
-        closable: showCloseButton,
+        // IDEA: hiding the close button is visual only. Keep close gestures
+        // (middle click, Shift+click, Delete) alive when its position is None.
+        showCloseButton,
         color: colors[i] || undefined,
-        tint: tints[i] || undefined,
+        tint:
+          tints[i] || (fileColors && t.input.kind === "file" && t.input.path ? fileColors(t.input.path) : undefined),
+        tintStrength: tints[i] ? undefined : "var(--file-tint-strength)",
         tooltip: virtualTooltip(t.input) ?? (showFullPathOnHover ? (t.input.path ?? name) : undefined),
-        trailing: t.pinned ? <Icon name="pin" size={11} className={styles.pin} label="Pinned" /> : undefined,
+        trailing:
+          kindMark || pin ? (
+            <>
+              {kindMark}
+              {pin}
+            </>
+          ) : undefined,
       };
     });
   }, [
-    fileIcons,
+    files,
     tabs,
     kinds,
+    titleRevision,
     dirty,
     colors,
+    errors,
     tints,
+    tabLabels,
+    tabIcons,
+    fileColors,
     hints,
     showExtension,
     markModified,
@@ -223,6 +276,7 @@ function PaneView({ paneId }: { paneId: string }) {
   const pinnedCount = tabs.filter((t) => t.pinned).length;
   // Settings › Editor Tabs › Tab placement Left / Right: a vertical, scrolling column.
   const vertical = tabPrefs.placement === "left" || tabPrefs.placement === "right";
+  const sideTabsStyle = useSideTabsStyle();
   const pinnedRow = tabPrefs.pinnedSeparateRow && pinnedCount > 0 && pinnedCount < tabs.length;
   const dnd = useMemo(() => {
     // A tab released outside the window detaches into a forced new window.
@@ -251,14 +305,16 @@ function PaneView({ paneId }: { paneId: string }) {
     const zoneAt = (x: number, y: number) => dropZoneAt(x, y, el.getBoundingClientRect());
     return registerDropTarget(el, {
       accepts: (type) => type === EDITOR_TAB_MIME || type === FILES_DRAG || acceptsEditorDrop(type),
-      over: (data, x, y) =>
-        setDropZone(data.type === EDITOR_TAB_MIME || data.type === FILES_DRAG ? zoneAt(x, y) : "center"),
+      over: (data, x, y) => {
+        if (data.type === FILES_DRAG) setDropZone(droppedFiles(data.payload).length ? zoneAt(x, y) : null);
+        else setDropZone(data.type === EDITOR_TAB_MIME ? zoneAt(x, y) : "center");
+      },
       leave: () => setDropZone(null),
       drop: (data, x, y) => {
         const zone = zoneAt(x, y);
         setDropZone(null);
         if (data.type === FILES_DRAG) {
-          void ctrl.openFilesIn(data.payload.split("\n").filter(Boolean), paneId, zone);
+          void ctrl.openFilesIn(droppedFiles(data.payload), paneId, zone);
           return;
         }
         if (data.type !== EDITOR_TAB_MIME) {
@@ -276,6 +332,7 @@ function PaneView({ paneId }: { paneId: string }) {
 
   if (!pane) return null;
   const active = pane.tabs.find((t) => t.id === pane.active) ?? null;
+  const kept = keptTabs(pane.tabs, pane.mru, kinds);
 
   const onFocus = () => {
     setContext("editorFocus", true);
@@ -334,7 +391,9 @@ function PaneView({ paneId }: { paneId: string }) {
         vertical && styles.tabsVertical,
         tabPrefs.placement === "right" && styles.tabsRight,
       )}
+      style={vertical ? sideTabsStyle : undefined}
       data-pane-id={paneId}
+      data-focus-scope=""
       aria-label={tx("Editor")}
       onFocus={onFocus}
       onBlur={onBlur}
@@ -348,17 +407,46 @@ function PaneView({ paneId }: { paneId: string }) {
       ) : (
         strip(items, dnd.all, actions)
       )}
-      <div
-        className={styles.content}
-        role="tabpanel"
-        id={active ? `editor-${paneId}-panel-${active.id}` : undefined}
-        aria-labelledby={active ? `editor-${paneId}-tab-${active.id}` : undefined}
-        ref={contentRef}
-      >
-        {active ? <PaneContent paneId={paneId} tab={active} tabsVisible={!hidden} /> : <EmptyEditor />}
-        {dropZone && <div className={clsx(styles.dropZone, styles[`drop-${dropZone}`])} aria-hidden="true" />}
+      {vertical && !hidden && <SideTabsResizer side={tabPrefs.placement === "left" ? "left" : "right"} />}
+      <div className={styles.body}>
+        <div
+          className={styles.content}
+          role="tabpanel"
+          id={active ? `editor-${paneId}-panel-${active.id}` : undefined}
+          aria-labelledby={active ? `editor-${paneId}-tab-${active.id}` : undefined}
+          ref={contentRef}
+        >
+          {kept.map((tab) => (
+            <KindEditor key={tab.id} tab={tab} shown={tab === active} kept />
+          ))}
+          {!active ? (
+            <EmptyEditor />
+          ) : (
+            !kept.includes(active) && <PaneContent paneId={paneId} tab={active} tabsVisible={!hidden} />
+          )}
+          {dropZone && <div className={clsx(styles.dropZone, styles[`drop-${dropZone}`])} aria-hidden="true" />}
+        </div>
+        <GroupPanels paneId={paneId} tabId={active && isTextInput(active.input) ? active.id : null} />
       </div>
     </section>
+  );
+}
+
+/**
+ * The group's contributed panels (plugin minimaps) at its right edge. Mounted once per group,
+ * kept while it switches tabs; hidden while the group shows something other than a text editor.
+ */
+function GroupPanels({ paneId, tabId }: { paneId: string; tabId: string | null }) {
+  const panels = useEditorGroupPanels((s) => s.panels);
+  if (!panels.size) return null;
+  return (
+    <div className={styles.groupPanels} hidden={!tabId}>
+      {[...panels.values()].map((p) => (
+        <div key={p.id} className={styles.groupPanel} style={{ width: p.width }}>
+          <p.component paneId={paneId} tabId={tabId} />
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -370,7 +458,6 @@ function virtualTooltip(input: EditorInput): string | null {
 }
 
 function PaneContent({ paneId, tab, tabsVisible }: { paneId: string; tab: Tab; tabsVisible: boolean }) {
-  const kinds = useContributions((s) => s.editorKinds);
   const crumbs = !useDistractionFree((s) => s.active);
   const wrappers = useTextEditorWrappers((s) => s.wrappers);
   if (isTextInput(tab.input)) {
@@ -402,12 +489,43 @@ function PaneContent({ paneId, tab, tabsVisible }: { paneId: string; tab: Tab; t
       </>
     );
   }
+  return <KindEditor key={tab.id} tab={tab} shown />;
+}
+
+/** Tabs of a pane kept mounted while hidden: the most recently used ones of `keepAlive` kinds. */
+const KEPT_TABS = 5;
+
+function keptTabs(tabs: Tab[], mru: string[], kinds: Map<string, EditorKindContribution>): Tab[] {
+  const recent = mru
+    .map((id) => tabs.find((t) => t.id === id))
+    .filter((t): t is Tab => !!t && !!kinds.get(t.input.kind)?.keepAlive)
+    .slice(0, KEPT_TABS);
+  // In tab order, so switching tabs doesn't move their DOM (which would lose scroll offsets).
+  return tabs.filter((t) => recent.includes(t));
+}
+
+/**
+ * `shown`: the pane's visible tab, which focusing the editor area reaches. A hidden `kept` tab
+ * keeps its layout (content-visibility), so showing it again needn't lay it out from scratch;
+ * its content can't be focused or hit while skipped.
+ */
+function KindEditor({ tab, shown, kept = false }: { tab: Tab; shown: boolean; kept?: boolean }) {
+  const kinds = useContributions((s) => s.editorKinds);
   const kind = kinds.get(tab.input.kind);
   if (!kind) return <EmptyState icon="file" title={tx`No editor for “${tab.input.kind}”`} />;
   const Component = kind.component;
   return (
-    <div className={styles.kind} data-editor-focus="" tabIndex={-1} key={tab.id}>
-      <Component input={tab.input} />
+    <div
+      className={clsx(styles.kind, kept && styles.kept, !shown && styles.keptHidden)}
+      data-editor-focus={shown ? "" : undefined}
+      tabIndex={-1}
+      aria-hidden={shown ? undefined : true}
+    >
+      <EditorTabIdProvider value={tab.id}>
+        <EditorShownProvider value={shown}>
+          <Component input={tab.input} />
+        </EditorShownProvider>
+      </EditorTabIdProvider>
     </div>
   );
 }
@@ -424,6 +542,7 @@ function EditorTabActions({ paneId, tab }: { paneId: string; tab: Tab }) {
   const moreRef = useRef<HTMLButtonElement>(null);
   return (
     <div className={styles.tabActions}>
+      <ContributedToolbar slot="editor.title" />
       {LayoutActions && <LayoutActions path={tab.input.path!} tabId={tab.id} />}
       <IconButton
         icon="split"
@@ -449,7 +568,8 @@ function EditorTabActions({ paneId, tab }: { paneId: string; tab: Tab }) {
         anchor={moreRef}
         placement="bottom-end"
         aria-label="Tab actions"
-        items={ctrl.tabMenu(paneId, tab)}
+        // Built when shown: every tab render (each open and switch) would otherwise assemble the whole menu.
+        items={open ? ctrl.tabMenu(paneId, tab) : []}
       />
     </div>
   );

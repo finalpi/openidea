@@ -20,9 +20,9 @@
 
 ## 提交信息插件
 
-当前功能需要桌面版 **v0.1.39** 与插件 **0.2.0**。插件目录为 `plugins/official/commit-assistant`，ID 为 `finalpi.commit-assistant`，编译后的组件已随源码保存。
+当前版本需要桌面版 **v0.1.50** 与插件 **0.2.1**。插件目录为 `plugins/official/commit-assistant`，ID 为 `finalpi.commit-assistant`，编译后的组件已随源码保存。
 
-1. 下载本 fork 的桌面安装包与 `finalpi.commit-assistant-0.2.0.oiplugin`，在 Settings → Plugins → Install Plugin from Disk 导入插件。覆盖更新即可，不必先卸载。
+1. 下载本 fork 的桌面安装包与 `finalpi.commit-assistant-0.2.1.oiplugin`，在 Settings → Plugins → Install Plugin from Disk 覆盖安装插件。
 2. 在 Settings → Plugins → Commit Assistant 同一页面填写 API Key、API base URL 和 Model。Key 点击 Save 后立即保存，其他字段点击 Apply / OK 保存。Key 按插件共用，不随 Global / This project 切换。
 3. 点击 Refresh models 后搜索并选择模型；服务不提供 `/models` 时，可手动输入模型 ID。
 4. Test API connection 检查模型列表接口；Test selected model 验证一次实际对话请求，显示状态和耗时。测试使用未应用的页面值，只发送短测试提示，不发送项目文件内容。Preview prompt 在本地显示当前提示词，不调用 API。
@@ -35,7 +35,7 @@
 
 常见 `.env`、私钥、证书及文件名中含 secret / credential 的路径会过滤；二进制、大文件和预算外文件只保留名称，不读取或发送其文件内容，符号链接不读取被指向文件的内容。这些规则不是完整的秘密检测，发送前仍需检查选中文件。API 默认要求 HTTPS，localhost 可使用 HTTP。
 
-API Key 留在 IDE 的专用密钥存储中，不放入普通设置和 Git，不返回给设置页面或插件代码。使用 AI 时需在插件详情页授予网络及密钥权限。`net:*` 用于自定义 API 域名，必须由用户明确授予，不自动放开其他插件已有的域名限制。
+API Key 留在 IDE 的专用密钥存储中。使用 AI 时，在插件详情页开启网络及密钥权限。新版通过 `net:ask` 请求连接权限，首次访问某个 API 域名时需要确认。
 
 ## Maven 跳过测试
 

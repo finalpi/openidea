@@ -1,15 +1,15 @@
 /** Where a project opens when this window already has one: System Settings › Project › "Open project in". */
-import { t } from "@/platform/i18n";
+import { t, tx } from "@/platform/i18n";
 import { call, commands, type RemoteTarget } from "@/platform/ipc";
 import { confirmLeaveProject, useProject } from "@/platform/project";
 import { connectRemote, isRemoteWindow } from "@/platform/remote";
 import { ask } from "./messages";
 import { maybeEditorService } from "./contributions";
 
-/** "Open project in": `new` | `same` | `attach` | `ask`. */
-export function openPolicy(): "ask" | "new" | "same" | "attach" {
+/** "Open project in": `new` | `same` | `ask`. */
+export function openPolicy(): "ask" | "new" | "same" | "tab" {
   const v = useProject.getState().settings?.general?.openProjectIn;
-  return v === "new" || v === "same" || v === "attach" ? v : "ask";
+  return v === "new" || v === "same" || v === "tab" ? v : "ask";
 }
 
 /**
@@ -17,27 +17,40 @@ export function openPolicy(): "ask" | "new" | "same" | "attach" {
  * per "Open project in", asking when set to (and remembering "Don't ask again").
  * `null`: cancelled.
  */
-export async function chooseProjectWindow(name: string, allowAttach = true): Promise<"new" | "same" | "attach" | null> {
+export async function chooseProjectWindow(
+  name: string,
+  allowAttach = true,
+): Promise<"new" | "same" | "attach" | "tab" | null> {
   const { project, lightEdit } = useProject.getState();
   if (!project && !lightEdit) return "same";
-  const canAttach = allowAttach && !!project && !isRemoteWindow();
-  const policy = openPolicy();
-  const mode = policy === "attach" && !canAttach ? "ask" : policy;
+  // Both ways of keeping this window's project: a workspace folder, or a project tab of this window.
+  const canAdd = allowAttach && !!project && !isRemoteWindow();
+  const mode = openPolicy();
+  // A project tab needs this window's project beside it; without one, a new window is the closest.
+  if (mode === "tab") return canAdd ? "tab" : "new";
   if (mode !== "ask") return mode;
   const r = await ask({
     title: t("app.window.askTitle"),
-    width: canAttach ? 640 : undefined,
-    body: t("app.window.askBody", { name }),
+    width: canAdd ? 640 : undefined,
+    body: canAdd
+      ? tx`Projects can be opened in a new window, replace the current project, be attached to the already opened projects, or open as a new tab of this window.\nHow would you like to open "${name}"?`
+      : t("app.window.askBody", { name }),
     buttons: [
       { id: "cancel", label: t("common.cancel") },
-      ...(canAttach ? [{ id: "attach", label: t("app.window.askAttach") }] : []),
+      ...(canAdd
+        ? [
+            { id: "attach", label: t("app.window.askAttach") },
+            { id: "tab", label: tx`New Tab` },
+          ]
+        : []),
       { id: "new", label: t("app.window.askNew") },
       { id: "same", label: t("app.window.askThis"), primary: true },
     ],
     checkbox: t("app.window.askRemember"),
   });
-  if (r.button !== "same" && r.button !== "new" && r.button !== "attach") return null;
-  if (r.checked) {
+  // "Attach" is one-off, as in IDEA: "Open project in" has no value for it, so Don't ask again ignores it.
+  if (r.button !== "same" && r.button !== "new" && r.button !== "attach" && r.button !== "tab") return null;
+  if (r.checked && r.button !== "attach") {
     try {
       useProject.setState({
         settings: await call(commands.settingsSet("global", "general.openProjectIn", JSON.stringify(r.button))),
@@ -66,7 +79,8 @@ export async function openRemoteProject(
     await call(commands.windowOpenRemote(target, path, true));
     return true;
   }
-  if (!(await confirmLeaveProject())) return false;
+  // The remote host's project doesn't take this window's untitled buffers.
+  if (!(await confirmLeaveProject(false))) return false;
   try {
     await here();
     return true;

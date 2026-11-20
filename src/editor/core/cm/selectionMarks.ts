@@ -4,8 +4,8 @@ import { Decoration, EditorView, ViewPlugin, type DecorationSet, type ViewUpdate
 /**
  * `drawSelection` paints the selection in a layer behind the text, so any mark with its own
  * background (light-scheme warnings, find matches, usages, semantic backgrounds…) hides it.
- * This repaints selected text in the innermost span: higher-precedence marks nest closer to the
- * text, and the only other `Prec.highest` marks (LSP semantic tokens) set colour, not background.
+ * This repaints selected text in the innermost span. At equal precedence the earlier source
+ * nests inside, so this must precede find and semantic decorations at `Prec.highest`.
  */
 const selectedMark = Decoration.mark({ class: "cm-openidea-selected" });
 
@@ -37,10 +37,19 @@ const plugin = ViewPlugin.fromClass(
 
 const theme = EditorView.baseTheme({
   ".cm-openidea-selected": {
-    backgroundColor: "var(--editor-selection-inactive, var(--bg-editor-selection-inactive))",
+    "--openidea-selected-bg": "var(--editor-selection-inactive, var(--bg-editor-selection-inactive))",
+    // Capped at `1lh` so a font taller than the line height does not bleed into the rows above and below.
+    // Safari before 16.4 has no `lh` and drops the shorthand, keeping the plain colour before it.
+    backgroundColor: "var(--openidea-selected-bg)",
+    background: "linear-gradient(var(--openidea-selected-bg), var(--openidea-selected-bg)) center / 100% 1lh no-repeat",
+    WebkitBoxDecorationBreak: "clone",
+    boxDecorationBreak: "clone",
+    // Unset (the default `inherit`): the declaration drops and the syntax colours show through.
+    color: "var(--fg-editor-selection)",
+    WebkitTextFillColor: "var(--fg-editor-selection)",
   },
   "&.cm-focused .cm-openidea-selected": {
-    backgroundColor: "var(--editor-selection, var(--bg-editor-selection))",
+    "--openidea-selected-bg": "var(--editor-selection, var(--bg-editor-selection))",
   },
 });
 

@@ -11,8 +11,13 @@ export interface SettingsCommandResult {
 }
 
 /** Configuration commands receive draft non-secret settings, never an API key. */
-export async function runSettingsCommand(pluginId: string, command: string, settings: Record<string, unknown>) {
-  const raw = await pluginsBackend().runCommand(pluginId, command, JSON.stringify({ settings }), null);
+export async function runSettingsCommand(
+  pluginId: string,
+  command: string,
+  settings: Record<string, unknown>,
+  scope: "global" | "project",
+) {
+  const raw = await pluginsBackend().runCommand(pluginId, command, JSON.stringify({ settings }), null, [], scope);
   const value: unknown = raw ? JSON.parse(raw) : null;
   if (!value || typeof value !== "object" || typeof (value as SettingsCommandResult).ok !== "boolean") {
     throw new Error(tx("The plugin returned an invalid diagnostic result"));

@@ -99,6 +99,8 @@ export interface FindTarget {
   /** Still open: an unmount that isn't a close (React's dev-mode remount) keeps the highlights. */
   isOpen(): boolean;
   results?(options: FindOptions): FindResultsSource | null;
+  /** A diff pane's "Search In Changes" filter, kept by the diff (not the last search). */
+  inChanges?: { get(): boolean; set(on: boolean): void };
 }
 
 const activeTab = (paneId: string) => useTabs.getState().panes[paneId]?.active ?? null;
@@ -184,6 +186,18 @@ export function openFindBarResults(arg?: unknown) {
 /** Longest selection that becomes the query. */
 const MAX_QUERY = 10_000;
 
+/** Selected text in the pane outside `.cm-editor` and the find bar (e.g. Markdown preview). */
+function paneDomSelection(view: EditorView | null): string {
+  if (!view || typeof window === "undefined") return "";
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return "";
+  const pane = view.dom.closest("[data-pane-id]");
+  const node = sel.getRangeAt(0).commonAncestorContainer;
+  const el = node instanceof Element ? node : node.parentElement;
+  if (!pane || !el || !pane.contains(el) || el.closest(".cm-editor, [role='search']")) return "";
+  return sel.toString();
+}
+
 /**
  * Opens (or refocuses) the bar, as in IDEA: the
  * selection becomes the query — multi-line too — and the search covers the
@@ -210,6 +224,18 @@ export function seedFind(target: FindTarget, replace: boolean) {
     else
       useFindSessions.setState({ [target.id]: { ...useFindOptions.getState(), ...patch(useFindOptions.getState()) } });
   };
+  const domText = paneDomSelection(view);
+  if (view && domText) {
+    view.dispatch({ effects: setFindScope.of(null) });
+    if (domText.length < MAX_QUERY) {
+      set((o) => ({ search: o.regexp ? domText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : domText }));
+      setQuery(view, optionsOf(target.id));
+      findNext(view);
+    } else {
+      set(() => ({}));
+    }
+    return;
+  }
   if (view && sel && !sel.empty) {
     const text = view.state.sliceDoc(sel.from, sel.to);
     const multiline = text.includes("\n");
@@ -301,7 +327,18 @@ export function FindBar({ paneId }: { paneId: string }) {
       onReplaceShown={(replace) => setReplaceShown(tabId, replace)}
       onClose={() => {
         useFindBars.setState({ [tabId]: undefined });
-        target.view()?.focus();
+        const view = target.view();
+        if (view && view.dom.offsetParent !== null) {
+          view.focus();
+        } else {
+          if (view && !view.state.selection.main.empty) {
+            view.dispatch({ selection: { anchor: view.state.selection.main.head } });
+          }
+          view?.dom
+            .closest("[data-pane-id]")
+            ?.querySelector<HTMLElement>('[role="document"]')
+            ?.focus({ preventScroll: true });
+        }
       }}
     />
   );
@@ -338,6 +375,13 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
   const [historyMenu, setHistoryMenu] = useState<"find" | "replace" | null>(null);
   const [filterMenu, setFilterMenu] = useState(false);
   const setOpts = (patch: Partial<FindOptions>) => updateOptions(id, () => patch);
+  // Search In Changes applies to finding only, as in IDEA: the replace bar searches the whole side.
+  const [inChangesOn, setInChangesOn] = useState(() => !!target.inChanges?.get());
+  const inChanges = !!target.inChanges && !replace && inChangesOn;
+  const toggleInChanges = () => {
+    target.inChanges?.set(!inChangesOn);
+    setInChangesOn(!inChangesOn);
+  };
 
   useLayoutEffect(() => {
     panelTargets.set(id, target);
@@ -386,15 +430,16 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
 
   // Push the query into the editor. Like IDEA, only a change of the query (typing, options)
   // selects the nearest match: showing the bar again over its editor leaves the caret alone.
-  const shown = useRef<{ target: FindTarget; version: unknown; opts: FindOptions } | null>(null);
+  const shown = useRef<{ target: FindTarget; version: unknown; opts: FindOptions; inChanges: boolean } | null>(null);
   useEffect(() => {
     const view = target.view();
     if (!view) return;
     const prev = shown.current;
-    const changed = prev?.target === target && prev.version === version && prev.opts !== opts;
-    shown.current = { target, version, opts };
+    const changed =
+      prev?.target === target && prev.version === version && (prev.opts !== opts || prev.inChanges !== inChanges);
+    shown.current = { target, version, opts, inChanges };
     const valid = !opts.regexp || regexValid(opts.search);
-    setQuery(view, valid ? opts : { ...opts, search: "" });
+    setQuery(view, valid ? { ...opts, inChanges } : { ...opts, search: "" });
     view.dispatch({ effects: setFindOpen.of(true) });
     if (changed && valid && opts.search && useFindPreferences.getState().scrollToResults) {
       const from = view.state.selection.main.from;
@@ -402,7 +447,7 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
       findNext(view);
     }
     recount(target);
-  }, [opts, target, version]);
+  }, [opts, target, version, inChanges]);
 
   // Keep the counter current while the document / selection changes.
   useEffect(() => {
@@ -529,6 +574,9 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
       checked: scoped || undefined,
       run: () => toggleScope(target),
     },
+    ...(target.inChanges && !replace
+      ? [{ label: "Search In Changes", checked: inChangesOn || undefined, run: toggleInChanges }]
+      : []),
     { kind: "separator" },
     { kind: "header", label: "Search Scope" },
     ...SEARCH_CONTEXTS.map((c) => ({
@@ -560,182 +608,185 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
   const canReplace = !!opts.search && !invalid;
 
   return (
-    <div
-      ref={panelRef}
-      onFocusCapture={() => {
-        focusedTarget = target;
-        setContext("findBarFocus", true);
-        setContext(
-          "findBarHasResults",
-          !!target.results && !!opts.search && (!opts.regexp || regexValid(opts.search)) && !!count?.total,
-        );
-      }}
-      onBlurCapture={(e) => {
-        if (!panelRef.current?.contains(e.relatedTarget as Node | null)) setContext("findBarFocus", false);
-      }}
-      className={clsx(styles.find, onReplaceShown && styles.findExpandable)}
-      role="search"
-      aria-label={replace ? "Replace in file" : "Find in file"}
-    >
-      {onReplaceShown && (
-        <IconButton
-          icon={replace ? "chevron-down" : "chevron-right"}
-          title={replace ? "Hide Replace" : "Show Replace"}
-          size="small"
-          className={styles.findExpand}
-          aria-expanded={replace}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => {
-            if (replaceBoxRef.current?.contains(document.activeElement)) inputRef.current?.focus();
-            onReplaceShown(!replace);
-          }}
+    <div className={styles.findContainer}>
+      <div
+        ref={panelRef}
+        onFocusCapture={() => {
+          focusedTarget = target;
+          setContext("findBarFocus", true);
+          setContext(
+            "findBarHasResults",
+            !!target.results && !!opts.search && (!opts.regexp || regexValid(opts.search)) && !!count?.total,
+          );
+        }}
+        onBlurCapture={(e) => {
+          if (!panelRef.current?.contains(e.relatedTarget as Node | null)) setContext("findBarFocus", false);
+        }}
+        className={styles.find}
+        role="search"
+        aria-label={replace ? "Replace in file" : "Find in file"}
+      >
+        {onReplaceShown && (
+          <IconButton
+            icon={replace ? "chevron-down" : "chevron-right"}
+            title={replace ? "Hide Replace" : "Show Replace"}
+            size="small"
+            className={styles.findExpand}
+            aria-expanded={replace}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              if (replaceBoxRef.current?.contains(document.activeElement)) inputRef.current?.focus();
+              onReplaceShown(!replace);
+            }}
+          />
+        )}
+        <div ref={findBoxRef} className={styles.findField}>
+          <SearchField
+            ref={inputRef}
+            value={opts.search}
+            onChange={(search) => setOpts({ search })}
+            placeholder="Find"
+            aria-label="Find"
+            invalid={invalid || none}
+            multiline
+            onHistory={() => setHistoryMenu("find")}
+            onKeyDown={(e) => onKeyDown(e, "find")}
+            className={styles.findInput}
+            toggles={[
+              {
+                id: "case",
+                icon: "case",
+                title: "Match Case",
+                shortcut: formatBinding("Alt+C"),
+                pressed: opts.caseSensitive,
+                onToggle: () => toggle("caseSensitive"),
+              },
+              {
+                id: "word",
+                icon: "word",
+                title: "Words",
+                shortcut: formatBinding("Alt+W"),
+                pressed: opts.wholeWord,
+                onToggle: () => toggle("wholeWord"),
+              },
+              {
+                id: "regex",
+                icon: "regex",
+                title: "Regex",
+                shortcut: formatBinding("Alt+X"),
+                pressed: opts.regexp,
+                onToggle: () => toggle("regexp"),
+              },
+            ]}
+          />
+        </div>
+        <div className={styles.findButtons}>
+          <span className={clsx(styles.findCount, (none || invalid) && styles.findCountNone)} aria-live="polite">
+            {counter}
+          </span>
+          <IconButton
+            icon="arrow-up"
+            title="Previous Occurrence"
+            shortcut={formatBinding("Shift+Enter")}
+            size="small"
+            onClick={() => run(findPrevious)}
+          />
+          <IconButton
+            icon="arrow-down"
+            title="Next Occurrence"
+            shortcut={formatBinding("Enter")}
+            size="small"
+            onClick={() => run(findNext)}
+          />
+          <IconButton
+            ref={filterRef}
+            icon="filter"
+            title="Filter Search Results"
+            size="small"
+            pressed={scoped || inChanges || opts.context !== "any"}
+            onClick={() => setFilterMenu(true)}
+          />
+          <IconButton ref={moreRef} icon="more" title="More" size="small" onClick={() => setMoreMenu(true)} />
+        </div>
+        <IconButton icon="close" title="Close" shortcut="⎋" size="small" className={styles.findClose} onClick={close} />
+        {replace && (
+          <>
+            <div ref={replaceBoxRef} className={styles.replaceField}>
+              <SearchField
+                ref={replaceRef}
+                value={opts.replace}
+                onChange={(value) => setOpts({ replace: value })}
+                placeholder="Replace"
+                aria-label="Replace"
+                multiline
+                onHistory={() => setHistoryMenu("replace")}
+                onKeyDown={(e) => onKeyDown(e, "replace")}
+                toggles={[
+                  {
+                    id: "preserveCase",
+                    icon: "preserve-case",
+                    title: "Preserve Case",
+                    pressed: opts.preserveCase,
+                    onToggle: () => toggle("preserveCase"),
+                  },
+                ]}
+              />
+            </div>
+            <div className={styles.replaceButtons}>
+              <Button
+                size="small"
+                title={tx`Replace (${formatBinding("Alt+P")})`}
+                onClick={doReplace}
+                disabled={!canReplace}
+              >
+                <T>Replace</T>
+              </Button>
+              <Button
+                size="small"
+                title={tx`Replace All (${formatBinding("Alt+A")})`}
+                onClick={doReplaceAll}
+                disabled={!canReplace}
+              >
+                <T>Replace All</T>
+              </Button>
+              <Button
+                size="small"
+                title={
+                  count?.excluded ? tx`Include (${formatBinding("Alt+L")})` : tx`Exclude (${formatBinding("Alt+L")})`
+                }
+                onClick={() => run(excludeCurrent)}
+                disabled={!canReplace || (!count?.total && !count?.excluded)}
+              >
+                {count?.excluded ? <T>Include</T> : <T>Exclude</T>}
+              </Button>
+            </div>
+          </>
+        )}
+        <Menu
+          open={historyMenu !== null}
+          anchor={historyMenu === "replace" ? replaceBoxRef : findBoxRef}
+          items={historyMenu ? historyItems(historyMenu) : []}
+          placement="bottom-start"
+          aria-label="Recent searches"
+          onClose={() => setHistoryMenu(null)}
         />
-      )}
-      <div ref={findBoxRef} className={styles.findField}>
-        <SearchField
-          ref={inputRef}
-          value={opts.search}
-          onChange={(search) => setOpts({ search })}
-          placeholder="Find"
-          aria-label="Find"
-          invalid={invalid || none}
-          multiline
-          onHistory={() => setHistoryMenu("find")}
-          onKeyDown={(e) => onKeyDown(e, "find")}
-          toggles={[
-            {
-              id: "case",
-              icon: "case",
-              title: "Match Case",
-              shortcut: formatBinding("Alt+C"),
-              pressed: opts.caseSensitive,
-              onToggle: () => toggle("caseSensitive"),
-            },
-            {
-              id: "word",
-              icon: "word",
-              title: "Words",
-              shortcut: formatBinding("Alt+W"),
-              pressed: opts.wholeWord,
-              onToggle: () => toggle("wholeWord"),
-            },
-            {
-              id: "regex",
-              icon: "regex",
-              title: "Regex",
-              shortcut: formatBinding("Alt+X"),
-              pressed: opts.regexp,
-              onToggle: () => toggle("regexp"),
-            },
-          ]}
+        <Menu
+          open={moreMenu}
+          anchor={moreRef}
+          items={moreItems}
+          placement="bottom-end"
+          aria-label="Find options"
+          onClose={() => setMoreMenu(false)}
+        />
+        <Menu
+          open={filterMenu}
+          anchor={filterRef}
+          items={filterItems}
+          placement="bottom-end"
+          aria-label="Filter search results"
+          onClose={() => setFilterMenu(false)}
         />
       </div>
-      <div className={styles.findButtons}>
-        <span className={clsx(styles.findCount, (none || invalid) && styles.findCountNone)} aria-live="polite">
-          {counter}
-        </span>
-        <IconButton
-          icon="arrow-up"
-          title="Previous Occurrence"
-          shortcut={formatBinding("Shift+Enter")}
-          size="small"
-          onClick={() => run(findPrevious)}
-        />
-        <IconButton
-          icon="arrow-down"
-          title="Next Occurrence"
-          shortcut={formatBinding("Enter")}
-          size="small"
-          onClick={() => run(findNext)}
-        />
-        <IconButton
-          ref={filterRef}
-          icon="filter"
-          title="Filter Search Results"
-          size="small"
-          pressed={scoped || opts.context !== "any"}
-          onClick={() => setFilterMenu(true)}
-        />
-        <IconButton ref={moreRef} icon="more" title="More" size="small" onClick={() => setMoreMenu(true)} />
-      </div>
-      <IconButton icon="close" title="Close" shortcut="⎋" size="small" className={styles.findClose} onClick={close} />
-      {replace && (
-        <>
-          <div ref={replaceBoxRef} className={styles.findField}>
-            <SearchField
-              ref={replaceRef}
-              value={opts.replace}
-              onChange={(value) => setOpts({ replace: value })}
-              placeholder="Replace"
-              aria-label="Replace"
-              multiline
-              onHistory={() => setHistoryMenu("replace")}
-              onKeyDown={(e) => onKeyDown(e, "replace")}
-              toggles={[
-                {
-                  id: "preserveCase",
-                  icon: "preserve-case",
-                  title: "Preserve Case",
-                  pressed: opts.preserveCase,
-                  onToggle: () => toggle("preserveCase"),
-                },
-              ]}
-            />
-          </div>
-          <div className={styles.replaceButtons}>
-            <Button
-              size="small"
-              title={tx`Replace (${formatBinding("Alt+P")})`}
-              onClick={doReplace}
-              disabled={!canReplace}
-            >
-              <T>Replace</T>
-            </Button>
-            <Button
-              size="small"
-              title={tx`Replace All (${formatBinding("Alt+A")})`}
-              onClick={doReplaceAll}
-              disabled={!canReplace}
-            >
-              <T>Replace All</T>
-            </Button>
-            <Button
-              size="small"
-              title={
-                count?.excluded ? tx`Include (${formatBinding("Alt+L")})` : tx`Exclude (${formatBinding("Alt+L")})`
-              }
-              onClick={() => run(excludeCurrent)}
-              disabled={!canReplace || (!count?.total && !count?.excluded)}
-            >
-              {count?.excluded ? <T>Include</T> : <T>Exclude</T>}
-            </Button>
-          </div>
-        </>
-      )}
-      <Menu
-        open={historyMenu !== null}
-        anchor={historyMenu === "replace" ? replaceBoxRef : findBoxRef}
-        items={historyMenu ? historyItems(historyMenu) : []}
-        placement="bottom-start"
-        aria-label="Recent searches"
-        onClose={() => setHistoryMenu(null)}
-      />
-      <Menu
-        open={moreMenu}
-        anchor={moreRef}
-        items={moreItems}
-        placement="bottom-end"
-        aria-label="Find options"
-        onClose={() => setMoreMenu(false)}
-      />
-      <Menu
-        open={filterMenu}
-        anchor={filterRef}
-        items={filterItems}
-        placement="bottom-end"
-        aria-label="Filter search results"
-        onClose={() => setFilterMenu(false)}
-      />
     </div>
   );
 }
