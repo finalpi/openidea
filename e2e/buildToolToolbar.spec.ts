@@ -83,14 +83,28 @@ for (const tool of ["maven", "gradle"] as const) {
     await more.click();
     await expect(menu.getByRole("menuitem", { name: "Analyze Dependencies…" })).toBeVisible();
     await expect(menu.getByRole("menuitem", { name: "Expand All" })).toBeVisible();
-    await menu.getByRole("menuitemcheckbox", { name: skipTests, checked: false }).click();
-    await expect(menu).toBeHidden();
-    await more.click();
-    await expect(menu.getByRole("menuitemcheckbox", { name: skipTests, checked: true })).toBeVisible();
+    const mavenSkipTests = page.getByRole("checkbox", { name: "Skip Tests", exact: true });
+    if (tool === "maven") {
+      await page.keyboard.press("Escape");
+      await expect(menu).toBeHidden();
+      await expect(mavenSkipTests).not.toBeChecked();
+      await mavenSkipTests.click();
+      await expect(mavenSkipTests).toBeChecked();
+    } else {
+      await menu.getByRole("menuitemcheckbox", { name: skipTests, checked: false }).click();
+      await expect(menu).toBeHidden();
+      await more.click();
+      await expect(menu.getByRole("menuitemcheckbox", { name: skipTests, checked: true })).toBeVisible();
+    }
     await setWidth(page, 360);
     await expect(menu).toBeHidden();
     await expect(more).toBeHidden();
-    await expect(toolbar.getByRole("button", { name: skipTests, pressed: true })).toBeVisible();
+    if (tool === "maven") {
+      await expect(mavenSkipTests).toBeVisible();
+      await expect(mavenSkipTests).toBeChecked();
+    } else {
+      await expect(toolbar.getByRole("button", { name: skipTests, pressed: true })).toBeVisible();
+    }
     await expect(toolbar.getByRole("button", { name: "Collapse All" })).toBeVisible();
     await setWidth(page, 190);
     await expect(more).toBeVisible();
